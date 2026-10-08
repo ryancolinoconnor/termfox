@@ -7,6 +7,8 @@ import {
   layoutRects, findNeighbour, fuzzy, isEditable, installPaintHook, createFileLogger,
   WindowSet, serializeLayout, deserializeLayout, autoWindowName, parseTabValue, PREFIX_KEYS,
   PressLedger, routeChromeKey as routeChrome,
+  formatError, formatLine, sanitizeLogText, redactText, validateActorMessage, routeActorMessage, RateLimiter,
+  CONTENT_ACTIONS, LOG_ARG_MAX, LOG_LINE_MAX,
 } from "../profile/chrome/JS/termfox/TermfoxCore.sys.mjs";
 
 const ev = (key, mods = {}, code) => ({
@@ -372,7 +374,8 @@ test("logger surfaces write failures to the console and the window, once", async
   await log.flush();
   assert.equal(log.failures, 2);
   assert.match(String(log.lastError), /denied/);
-  assert.equal(errors.filter(e => e.includes("CANNOT WRITE LOG FILE /ro/termfox.log")).length, 1);
+  assert.equal(errors.filter(e => e.includes("cannot write the log file")).length, 1);
+  assert.ok(!errors.some(e => e.includes("/ro")), "no profile path on the console");
   assert.deepEqual(seen, ["/ro/termfox.log"]);
 });
 
@@ -524,14 +527,137 @@ test("PressLedger matches each echo to its own press", () => {
   // repeats never match an echo; XUL repeat is swallowed
   L.record({ action: "split-col", verdict: "take", repeat: true });
   assert.equal(L.xulKey("split-col").run, false);
-  // records expire
-  L.record({ action: "split-row", verdict: "take", browserId: 4 });
+  // records expire; with no live record of a trusted press, content can't run anything
+  L.record({ action: "split-row", verdict: "defer", browserId: 4 });
   t += 5000;
-  assert.equal(L.content("split-row", 4, "content").run, true);
+  assert.equal(L.content("split-row", 4, "content").run, false);
 });
 
 test("empty chrome text field: Ctrl+H/Y/Arrow are taken, not passed", () => {
   const ctrlH = b("h", ctrl);
   assert.equal(routeChrome(ctrlH, { chromeEditable: true, chromeFieldEmpty: false, layoutVisible: true }).verdict, "pass");
   assert.equal(routeChrome(ctrlH, { chromeEditable: true, chromeFieldEmpty: true, layoutVisible: true }).verdict, "take");
+});
+
+// ---- security hardening (audit 2026-10-08)
+
+function fakeIOWithRemove() {
+  const io = fakeIO();
+  io.remove = async p => { io.files.delete(p); };
+  return io;
+}
+
+test("M1: file logging is off unless enabled; private contexts never reach the disk", async () => {
+  const io = fakeIOWithRemove();
+  let debug = false;
+  const log = createFileLogger({ io, dir: "/p", joinPath: (...p) => p.join("/"), consoleObj: quiet, fileEnabled: () => debug });
+  log.log("split-col done in 3 ms");
+  await log.flush();
+  assert.equal(io.files.size, 0, "termfox.debugLog defaults to off: nothing on disk");
+  debug = true;
+  log.forContext({ private: true }).log("from a private window");
+  log.forContext({ private: false }).log("normal");
+  await log.flush();
+  const text = io.files.get("/p/termfox.log");
+  assert.match(text, /INFO normal/);
+  assert.doesNotMatch(text, /private window/);
+});
+
+test("M1: log strings are sanitized and bounded; errors keep only redacted message and stack frames", () => {
+  assert.equal(sanitizeLogText("a\nb\rc\u0007d\u2028e"), "a?b?c?d?e");
+  assert.equal(sanitizeLogText("x".repeat(1000)).length, LOG_ARG_MAX + 1);
+  const line = formatLine("INFO", ["y".repeat(LOG_ARG_MAX), "z".repeat(LOG_ARG_MAX), ..."0123456789".split("").map(() => "w".repeat(LOG_ARG_MAX))], new Date(0));
+  assert.ok(line.length < LOG_LINE_MAX + 60);
+  assert.equal(line.split("\n").length, 2, "one line, no injected newlines");
+  const e = new Error('Could not open C:\\Users\\someone\\AppData\\termfox.log for "hunter2" at https://mail.example.com/inbox?x=1 me@example.com 4111111111111111');
+  e.stack = "write@chrome://userscripts/content/termfox/TermfoxCore.sys.mjs:10:5\nevil\"payload@file:///C:/Users/someone/secret/thing.js:1:2\n@https://bank.example/app.js:3:4";
+  const out = formatError(e);
+  for (const leak of ["someone", "hunter2", "mail.example.com", "me@example.com", "4111111111111111", "bank.example", "payload"]) {
+    assert.ok(!out.includes(leak), `${leak} leaked: ${out}`);
+  }
+  assert.match(out, /chrome:\/\/userscripts\/content\/termfox\/TermfoxCore\.sys\.mjs:10:5/);
+  assert.match(out, /thing\.js:1:2/);
+  assert.equal(redactText("open /home/someone/x and 'quoted'"), "open <path> and <str>");
+});
+
+test("M1: clear log removes termfox and pre-rename tilefox log files", async () => {
+  const io = fakeIOWithRemove();
+  for (const f of ["termfox.log", "termfox.log.1", "tilefox.log", "other.txt"]) { io.files.set("/p/" + f, "x"); }
+  const log = createFileLogger({ io, dir: "/p", joinPath: (...p) => p.join("/"), consoleObj: quiet });
+  const removed = await log.clear();
+  assert.deepEqual(removed.sort(), ["termfox.log", "termfox.log.1", "tilefox.log"]);
+  assert.deepEqual([...io.files.keys()], ["/p/other.txt"]);
+});
+
+test("M3: actor schema: allowlisted actions, never kill, known via, finite t, no extra or free-text fields", () => {
+  const ok = (n, d) => validateActorMessage(n, d).ok;
+  assert.ok(ok("Termfox:Action", { action: "split-col", via: "content", t: 1 }));
+  assert.ok(ok("Termfox:Action", { action: "select-window-3", via: "content-fallback", t: 1 }));
+  assert.ok(!CONTENT_ACTIONS.has("kill"));
+  assert.equal(validateActorMessage("Termfox:Action", { action: "kill", via: "content", t: 1 }).why, "kill is chrome-only");
+  for (const bad of [
+    { action: "reload", via: "content", t: 1 }, // prefix-only, not a content key
+    { action: "clear-log", via: "content", t: 1 },
+    { action: "x".repeat(5000), via: "content", t: 1 },
+    { action: "split-col", via: "keydown", t: 1 },
+    { action: "split-col", via: "content", t: NaN },
+    { action: "split-col", via: "content", t: Infinity },
+    { action: "split-col", via: "content", t: "1" },
+    { action: "split-col", via: "content" },
+    { action: "split-col", via: "content", t: 1, extra: true },
+    { action: ["split-col"], via: "content", t: 1 },
+  ]) {
+    assert.ok(!ok("Termfox:Action", bad), JSON.stringify(bad).slice(0, 80));
+  }
+  assert.ok(!ok("Termfox:Action", "split-col"));
+  assert.ok(ok("Termfox:Hello", {}));
+  assert.ok(!ok("Termfox:Hello", { where: "https://example.com" }), "no origin in hello");
+  assert.ok(ok("Termfox:Log", { ev: "take", action: "split-col" }));
+  assert.ok(!ok("Termfox:Log", { msg: "free text\nINJECTED" }));
+  assert.ok(!ok("Termfox:Log", { ev: "anything" }));
+  assert.ok(!ok("Termfox:Eval", {}));
+});
+
+test("M3: routeActorMessage never hands kill or malformed actions to the window, and rate-limits logging", () => {
+  const calls = [];
+  const inst = { onActorAction: (d) => calls.push(["action", d]), onActorHello: () => calls.push(["hello"]) };
+  const lines = [];
+  const log = { forContext: () => ({ log: m => lines.push(m), warn: m => lines.push(m), error: m => lines.push(m) }) };
+  let t = 0;
+  const limiter = new RateLimiter({ burst: 3, perSec: 1, now: () => t });
+  const browser = { browserId: 5 };
+  const route = (name, data, priv = false) => routeActorMessage({ name, data, browser, priv, inst, log, limiter });
+  assert.equal(route("Termfox:Action", { action: "kill", via: "content", t: 1 }), "rejected");
+  assert.equal(route("Termfox:Action", { action: "split-col", via: "content", t: 1, x: 1 }), "rejected");
+  assert.equal(calls.length, 0);
+  assert.equal(route("Termfox:Action", { action: "split-col", via: "content", t: 1 }), "action");
+  assert.deepEqual(calls[0], ["action", { action: "split-col", via: "content", t: 1 }]);
+  t += 10000; // the two rejection warnings above used tokens too; refill
+  lines.length = 0;
+  for (let i = 0; i < 50; i++) { route("Termfox:Log", { ev: "take" }); }
+  assert.equal(lines.length, 3, "a flood of log events is cut to the burst");
+  t += 2000;
+  route("Termfox:Log", { ev: "take" });
+  assert.equal(lines.length, 4, "refills over time");
+  lines.length = 0;
+  t += 10000;
+  route("Termfox:Log", { ev: "take" }, true);
+  route("Termfox:Action", { action: "kill" }, true);
+  assert.equal(lines.length, 0, "private contexts log nothing");
+});
+
+test("M3: content can only spend a trusted press the parent saw, for the same browser and action", () => {
+  const L = new PressLedger({ now: () => 0 });
+  assert.equal(L.content("split-col", 7, "content").run, false, "no press: refused");
+  assert.equal(L.content("split-col", 7, "content-fallback").run, false);
+  L.record({ action: "split-col", verdict: "defer", browserId: 7 });
+  assert.equal(L.content("split-col", 8, "content").run, false, "another browser can't spend it");
+  assert.equal(L.content("split-row", 7, "content").run, false, "another action can't spend it");
+  assert.equal(L.content("split-col", 7, "content").run, true);
+  assert.equal(L.content("split-col", 7, "content").run, false, "spent once");
+  L.record({ action: "prefix", verdict: "pass", browserId: 7 }); // chrome couldn't check typing
+  assert.equal(L.content("prefix", 7, "content-fallback").run, false);
+  assert.equal(L.content("prefix", 7, "content").run, true, "the actor may take a passed press");
+  L.record({ action: "palette", verdict: "take", browserId: null }); // chrome focus, no browser
+  assert.equal(L.content("palette", null, "content-fallback").run, false);
 });

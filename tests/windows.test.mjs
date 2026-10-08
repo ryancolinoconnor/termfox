@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import * as Core from "../profile/chrome/JS/termfox/TermfoxCore.sys.mjs";
 
+const FakePBU = { isWindowPrivate: w => !!w.isPrivate };
 const SRC = readFileSync(new URL("../profile/chrome/JS/termfox.uc.mjs", import.meta.url), "utf8");
 const tick = () => new Promise(r => setTimeout(r, 5));
 
@@ -31,7 +32,7 @@ function el(tag = "div") {
 // finishes `switchDelay` ms after selection, like AsyncTabSwitcher. switchEvents: which events the
 // finished switch sends. Firefox 157 with live panes sends TabSwitched ({detail: {tab}}) but its
 // TabSwitchDone (switcher finish()) can stay out (live log 2026-10-08 18:57).
-function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents = ["TabSwitched", "TabSwitchDone"], userPrefs = {} } = {}) {
+function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents = ["TabSwitched", "TabSwitchDone"], userPrefs = {}, isPrivate = false, otherWindows = [] } = {}) {
   const prefs = new Map(Object.entries(userPrefs));
   const tcListeners = {};
   const winListeners = {};
@@ -106,7 +107,7 @@ function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents
     setCustomTabValue: (t, k, v) => { tabValues.set(t, { ...tabValues.get(t), [k]: v }); },
   };
   const win = {
-    document: doc, gBrowser: gb, SessionStore, FirefoxViewHandler: { tab: null }, BROWSER_NEW_TAB_URL: "about:newtab",
+    isPrivate, document: doc, gBrowser: gb, SessionStore, FirefoxViewHandler: { tab: null }, BROWSER_NEW_TAB_URL: "about:newtab",
     gURLBar: { select() {} }, focus() {}, setTimeout, clearTimeout, performance,
     addEventListener(t, f) { (winListeners[t] ||= []).push(f); },
     UC_API: { Windows: { waitWindowLoading: async () => {} }, Notifications: { show: async () => {} } },
@@ -130,10 +131,10 @@ function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents
       addObserver() {}, removeObserver() {},
     },
     appinfo: { version: "157.0.1" },
-    wm: { getEnumerator: () => [win] },
+    wm: { getEnumerator: () => [win, ...otherWindows] },
     ppmm: { sharedData: { set() {}, flush() {} } },
   };
-  const ctx = vm.createContext({ window: win, Services, ChromeUtils: { importESModule: () => Core }, UC_API: win.UC_API, console, Date, Math, JSON, Promise });
+  const ctx = vm.createContext({ window: win, Services, ChromeUtils: { importESModule: url => (url.includes("PrivateBrowsingUtils") ? { PrivateBrowsingUtils: FakePBU } : Core) }, UC_API: win.UC_API, console, Date, Math, JSON, Promise });
   return { win, gb, ctx, prefs, tabValues, winValues, saved: () => ({ win: { ...winValues } }) };
 }
 
@@ -286,10 +287,10 @@ async function settled(T) {
   }
   throw new Error("queue never drained");
 }
-function keyEvent(key, mods, target, { repeat = false, timeStamp = performance.now() } = {}) {
+function keyEvent(key, mods, target, { repeat = false, timeStamp = performance.now(), isTrusted = true } = {}) {
   const code = key.startsWith("Arrow") ? key : "Key" + key.toUpperCase();
   const e = { key, code, ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, ...mods,
-    repeat, target, composedTarget: target, prevented: false, isComposing: false, timeStamp };
+    repeat, target, composedTarget: target, prevented: false, isComposing: false, timeStamp, isTrusted };
   e.preventDefault = () => { e.prevented = true; };
   e.stopPropagation = () => {};
   return e;
@@ -396,6 +397,8 @@ test("a stuck action can't wedge the queue", silence(async () => {
 // Shaped like Firefox 157: TermfoxParent gets the <browser> from browsingContext.top.embedderElement,
 // and browser.ownerGlobal is not an object on which the window script's `window.Termfox` shows up.
 globalThis.JSWindowActorParent ??= class {};
+// TermfoxParent asks PrivateBrowsingUtils whether the sender's browser is private.
+globalThis.ChromeUtils ??= { importESModule: () => ({ PrivateBrowsingUtils: { isBrowserPrivate: br => !!br.isPrivate } }) };
 const { TermfoxParent } = await import("../profile/chrome/JS/termfox/TermfoxParent.sys.mjs");
 function actorFor(browser) {
   const a = new TermfoxParent();
@@ -420,11 +423,11 @@ test("parent actor finds the window when ownerGlobal.Termfox is not visible (157
   assert.equal(page.ownerGlobal.Termfox, undefined, "the old lookup (ownerGlobal.Termfox) fails here");
   const actor = actorFor(page);
   const warns = await captureWarnings(async () => {
-    send(actor, "Termfox:Hello", { where: "https://example.com" });
+    send(actor, "Termfox:Hello", {});
     assert.ok(T.actorBrowsers.has(page), "hello registers, so the window lets content decide typing");
     // Ctrl+A on <body>: the window defers to the actor, the actor says prefix.
     T.onChromeKeydown(keyEvent("a", { ctrlKey: true }, page));
-    send(actor, "Termfox:Action", { action: "prefix", via: "content" });
+    send(actor, "Termfox:Action", { action: "prefix", via: "content", t: Date.now() });
     await settled(T);
   });
   assert.equal(T.panel.state, "open", "prefix panel opened from a content-routed Ctrl+A");
@@ -442,7 +445,8 @@ test("parent actor resolves via ownerGlobal when it is the window, and each wind
   send(actorFor(pb), "Termfox:Hello", {});
   assert.ok(a.T.actorBrowsers.has(pa) && !a.T.actorBrowsers.has(pb));
   assert.ok(b.T.actorBrowsers.has(pb) && !b.T.actorBrowsers.has(pa));
-  send(actorFor(pb), "Termfox:Action", { action: "split-col", via: "content" });
+  b.T.onChromeKeydown(keyEvent("h", { ctrlKey: true }, pb)); // the trusted press the action spends
+  send(actorFor(pb), "Termfox:Action", { action: "split-col", via: "content", t: Date.now() });
   await settled(b.T);
   await settled(a.T);
   assert.equal(b.T.paneTabs().length, 2);
@@ -452,8 +456,8 @@ test("parent actor resolves via ownerGlobal when it is the window, and each wind
 test("parent actor still warns for a browser no termfox window owns", silence(async () => {
   await boot();
   const stray = { browserId: 999, ownerGlobal: {}, localName: "browser" };
-  const warns = await captureWarnings(() => send(actorFor(stray), "Termfox:Action", { action: "prefix", via: "content" }));
-  assert.ok(warns.some(w => w.includes("actor action but no Termfox in window")), warns.join("\n"));
+  const warns = await captureWarnings(() => send(actorFor(stray), "Termfox:Action", { action: "prefix", via: "content", t: Date.now() }));
+  assert.ok(warns.some(w => w.includes("but no termfox in its window")), warns.join("\n"));
 }));
 
 // ---- tab switch wait (live: "split: no TabSwitchDone after 1500 ms" on every split/focus)
@@ -620,4 +624,126 @@ test("windows saved under the tilefox SessionStore names are restored after the 
   assert.equal(g.T.paneTabs().length, 2);
   assert.deepEqual(g.visible(), ["mail", "tab1"]);
   assert.ok(g.winValues[Core.WINDOWS_VALUE], "re-saved under the termfox name");
+}));
+
+// ---- security hardening (audit 2026-10-08)
+
+async function captureLog(fn) {
+  const lines = [];
+  const l = console.log; const w = console.warn; const e = console.error;
+  console.log = console.warn = console.error = (...a) => lines.push(a.join(" "));
+  try { await fn(); } finally { console.log = l; console.warn = w; console.error = e; }
+  return lines;
+}
+
+test("M2: private and normal Firefox windows never list each other in the palette", silence(async () => {
+  const priv = await boot({ isPrivate: true });
+  priv.gb.selectedTab.label = "secret-private-tab";
+  const normal = await boot({ otherWindows: [priv.win] });
+  const labels = normal.T.allItems().map(i => i.label).join(" | ");
+  assert.ok(!labels.includes("secret-private-tab"), labels);
+  assert.ok(labels.includes("mail"));
+  const priv2 = await boot({ isPrivate: true, otherWindows: [normal.win, priv.win] });
+  const pl = priv2.T.allItems().map(i => i.label).join(" | ");
+  assert.ok(pl.includes("secret-private-tab"), "private windows see each other");
+  assert.equal(priv2.T.allItems().filter(i => i.win === normal.win).length, 0, "but not normal windows");
+}));
+
+test("M2: a private window keeps its windows in memory only and logs nothing", silence(async () => {
+  const lines = await captureLog(async () => {
+    const f = await boot({ isPrivate: true });
+    await f.run("split-row");
+    await f.run("new-window");
+    f.T.renameWindow("private-name");
+    f.T.persistNow();
+    assert.equal(Object.keys(f.winValues).length, 0, "no SessionStore window value");
+    assert.equal(f.tabValues.size, 0, "no SessionStore tab values");
+    assert.equal(f.T.ws.get(f.T.ws.current).name, "private-name", "still named in memory");
+  });
+  assert.deepEqual(lines.filter(l => l.includes("[termfox]")), []);
+}));
+
+test("M1: the log never contains window names, typed prefix keys, confirm keys or hosts", silence(async () => {
+  let f;
+  const panelKey = key => {
+    const e = keyEvent(key, {}, null);
+    e.stopPropagation = () => {};
+    f.T.onPanelKey(e);
+  };
+  const lines = await captureLog(async () => {
+    f = await boot({ saved: { tabs: [{ label: "bank" }] } });
+    f.T.renameWindow("hunter2-name");
+    await f.run("new-window");
+    await f.run("last-window");
+    f.T.openPanel("prefix");
+    panelKey("q"); // not a prefix key: cancel
+    f.T.openPanel("confirm");
+    panelKey("z"); // not y: cancel
+    await f.run("kill-window");
+    f.T.killWindow();
+    f.T.restoreFromSession("test");
+    await f.T.idle();
+  });
+  const text = lines.join("\n");
+  assert.match(text, /prefix -> cancel/);
+  for (const leak of ["hunter2-name", "bank.example.com", "bank", "prefix key", "confirm: z", "code Key"]) {
+    assert.ok(!text.includes(leak), `${leak} in the log:\n${text}`);
+  }
+}));
+
+test("M3: untrusted (synthetic) key events are ignored by the chrome listener and the panel", silence(async () => {
+  const f = await boot();
+  const e = keyEvent("h", { altKey: true }, null, { isTrusted: false });
+  f.T.onChromeKeydown(e);
+  await f.T.idle();
+  assert.equal(e.prevented, false);
+  assert.equal(f.T.paneTabs().length, 0);
+  f.T.openPanel("prefix");
+  f.T.onPanelKey(keyEvent("y", {}, null, { isTrusted: false }));
+  await f.T.idle();
+  assert.equal(f.T.paneTabs().length, 0);
+}));
+
+test("M3: a content action with no trusted press for that browser is refused", silence(async () => {
+  const f = await boot();
+  const page = browserEl(f.gb.tabs[0]);
+  f.T.onActorHello(page);
+  f.T.onActorAction({ action: "split-col", via: "content", t: Date.now() }, page);
+  f.T.onActorAction({ action: "kill", via: "content", t: Date.now() }, page);
+  await f.T.idle();
+  assert.equal(f.T.paneTabs().length, 0);
+  assert.equal(f.ctx.Services.prefs.getBoolPref("termfox.enabled", true), true, "content can't pause termfox");
+}));
+
+test("M5: paused = no key handling, no actions, no logging; the pause key resumes and reconciles tabs", silence(async () => {
+  let f;
+  const pauseKey = () => keyEvent("k", { ctrlKey: true, altKey: true, shiftKey: true }, null);
+  const lines = await captureLog(async () => {
+    f = await boot();
+    await f.run("new-window"); // window 1
+  });
+  assert.ok(lines.some(l => l.includes("[termfox]")), "logs while running");
+  const page = browserEl(f.gb.selectedTab);
+  f.T.onActorHello(page);
+  const toggle = async () => { f.T.onChromeKeydown(pauseKey()); await f.T.idle(); f.T.onEnabledChanged(); };
+  await toggle();
+  assert.equal(f.ctx.Services.prefs.getBoolPref("termfox.enabled", true), false, "paused");
+  const pausedLines = await captureLog(async () => {
+    const e = keyEvent("h", { altKey: true }, page);
+    f.T.onChromeKeydown(e);
+    assert.equal(e.prevented, false, "Alt+H goes to Firefox while paused");
+    f.T.onActorAction({ action: "split-col", via: "content", t: Date.now() }, page);
+    await f.T.runAction("split-row", "test");
+    f.gb.addTrustedTab("x", { label: "opened-while-paused" });
+    f.gb.removeTab(f.gb.tabs.find(t => t.label === "mail"));
+    await tick();
+  });
+  assert.equal(f.T.paneTabs().length, 0);
+  assert.deepEqual(pausedLines.filter(l => l.includes("[termfox]")), [], "nothing logged while paused");
+  assert.equal(f.T.ws.ownerOf(f.gb.tabs.find(t => t.label === "opened-while-paused")), null, "no bookkeeping while paused");
+  await toggle();
+  assert.equal(f.ctx.Services.prefs.getBoolPref("termfox.enabled", false), true, "resumed");
+  const added = f.gb.tabs.find(t => t.label === "opened-while-paused");
+  assert.ok(f.T.ws.ownerOf(added), "a tab opened while paused joins a window on resume");
+  assert.equal(f.T.ws.windows.length, 1, "window 0 lost its only tab while paused: gone on resume");
 }));

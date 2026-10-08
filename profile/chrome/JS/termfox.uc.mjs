@@ -9,7 +9,9 @@
  *   https://github.com/MrOtherGuy/fx-autoconfig#usage
  * Pinned loader commit: dfdab5684faffc112b76ccb1d8cab7f75da0102c (loader @version 0.10.16)
  * Target: Firefox Release 157.0.1 and 158+ (checked against tag FIREFOX_157_0_1_RELEASE, 2026-10-08).
- * Everything that touches Firefox internals is feature-detected and logged to <profile>/termfox.log.
+ * Everything that touches Firefox internals is feature-detected and logged: to the Browser Console,
+ * and to <profile>/termfox.log only when termfox.debugLog is true (off by default). Logs hold action
+ * ids, outcomes and timings, never typed keys, hosts, titles or window names (Core: file log).
  *
  * HOW PANES WORK (riskiest part, read this first)
  * - Every pane is a real tab. We never reparent <browser> elements (reparenting would
@@ -47,7 +49,7 @@
  * - Primary path: one capture-phase keydown listener on the chrome window. It sees every key
  *   before Firefox's <key> handlers and before the event is forwarded to web content, and logs
  *   each decision (Core.routeChromeKey).
- * - "Always" keys (Alt+Y/H, Alt+Arrow, Ctrl+Space, Ctrl+Shift+P, kill) are taken here. They are
+ * - "Always" keys (Alt+Y/H, Alt+Arrow, Ctrl+Space, Ctrl+Shift+P, pause) are taken here. They are
  *   also fx-autoconfig Hotkeys (reserved="true", original <key>s disabled) as a secondary path;
  *   Core.PressLedger matches each path to the press it came from, so one press runs once.
  *   https://github.com/MrOtherGuy/fx-autoconfig#hotkeys
@@ -63,8 +65,27 @@ const PREF_ENABLED = "termfox.enabled";
 const PREF_STATUSBAR = "termfox.statusbar";
 const PREF_KEYS_BRANCH = Core.KEY_PREF_BRANCH;
 const logger = Core.getLogger();
-const LOG = (...a) => logger.log(...a);
-const ERR = (...a) => logger.error(...a);
+
+// Private browsing (security audit M2): a private window never writes to the disk log, never
+// persists its windows through SessionStore, and its tabs never show in a normal window's
+// palette (nor normal tabs in its palette). Unknown = private (fail closed).
+let PBU = null;
+try {
+  PBU = ChromeUtils.importESModule("resource://gre/modules/PrivateBrowsingUtils.sys.mjs").PrivateBrowsingUtils || null;
+} catch (e) {}
+function isPrivateWindow(w) {
+  try {
+    return PBU ? !!PBU.isWindowPrivate(w) : true;
+  } catch (e) {
+    return true;
+  }
+}
+const PRIVATE = isPrivateWindow(window);
+// Producer-side check here; the logger refuses {private: true} contexts again before any write.
+const wlog = logger.forContext({ private: PRIVATE });
+const LOG = (...a) => (PRIVATE ? undefined : wlog.log(...a));
+const WARN = (...a) => (PRIVATE ? undefined : wlog.warn(...a));
+const ERR = (...a) => (PRIVATE ? undefined : wlog.error(...a));
 
 // The TermfoxWindow of a Firefox window. Core's registry is the source of truth (the parent actor
 // and fx-autoconfig's hotkey commands run in other modules); window.Termfox is kept for debugging.
@@ -87,6 +108,7 @@ function overriddenKeys(keyMap) {
 class TermfoxWindow {
   constructor(win) {
     this.win = win;
+    this.private = isPrivateWindow(win);
     this.doc = win.document;
     this.gBrowser = win.gBrowser;
     // Windows: each has its own layout tree ({tab} leaf | {dir:"row"|"col", a, b, ratio}).
@@ -117,6 +139,8 @@ class TermfoxWindow {
     this.paletteIndex = 0;
   }
 
+  // false = paused (termfox.enabled; the UI calls it pause/resume). Paused, termfox only
+  // listens for the resume key: no layout, key routing, logging, actor activity or bookkeeping.
   get enabled() {
     return Services.prefs.getBoolPref(PREF_ENABLED, true);
   }
@@ -153,7 +177,7 @@ class TermfoxWindow {
   }
 
   init() {
-    LOG(`window init: Firefox ${Services.appinfo.version}, enabled = ${this.enabled}`);
+    LOG(`window init: Firefox ${Services.appinfo.version}, paused = ${!this.enabled}`);
     this.setupBackgroundPainting();
     this.defineHotkeys();
     this.buildPanel();
@@ -165,28 +189,31 @@ class TermfoxWindow {
     for (const tab of this.gBrowser.tabs) {
       this.adopt(tab);
     }
-    this._onSelect = () => this.safe(() => { this.onTabSelect(); this.wake(); });
-    this._onClose = e => this.safe(() => this.onTabClose(e.target));
+    // Paused: the listeners stay attached (so resume works) but do nothing. TabClose still drops
+    // the closed tab from the bookkeeping; resume() reconciles everything else.
+    const live = fn => (...a) => this.safe(() => (this.enabled ? fn(...a) : undefined));
+    this._onSelect = live(() => { this.onTabSelect(); this.wake(); });
+    this._onClose = e => this.safe(() => (this.enabled ? this.onTabClose(e.target) : this.forgetTab(e.target)));
     tc.addEventListener("TabSelect", this._onSelect);
     tc.addEventListener("TabClose", this._onClose);
-    tc.addEventListener("TabOpen", e => this.safe(() => this.onTabOpen(e.target)));
+    tc.addEventListener("TabOpen", live(e => this.onTabOpen(e.target)));
     // A tab's <browser> and panel exist (Tabbrowser._insertBrowser): wakes settle()'s panel wait.
-    tc.addEventListener("TabBrowserInserted", () => this.safe(() => this.wake()));
-    tc.addEventListener("TabPinned", () => this.safe(() => this.applyVisibility()));
-    tc.addEventListener("TabUnpinned", () => this.safe(() => this.applyVisibility()));
-    tc.addEventListener("TabAttrModified", e => {
+    tc.addEventListener("TabBrowserInserted", live(() => this.wake()));
+    tc.addEventListener("TabPinned", live(() => this.applyVisibility()));
+    tc.addEventListener("TabUnpinned", live(() => this.applyVisibility()));
+    tc.addEventListener("TabAttrModified", live(e => {
       if (e.detail?.changed?.includes("label")) {
-        this.safe(() => this.updateStatus());
+        this.updateStatus();
       }
-    });
-    tc.addEventListener("SSTabRestoring", e => this.safe(() => this.onTabRestoring(e.target)));
+    }));
+    tc.addEventListener("SSTabRestoring", live(e => this.onTabRestoring(e.target)));
     this.win.addEventListener("SSWindowRestored", () => this.safe(() => this.restoreFromSession("SSWindowRestored")));
     const SS = this.win.SessionStore;
     Promise.resolve(SS?.promiseAllWindowsRestored).then(
       () => this.safe(() => this.restoreFromSession("promiseAllWindowsRestored")),
       e => ERR("promiseAllWindowsRestored", e));
-    this.win.addEventListener("TabSwitchDone", () => this.safe(() => this.onSwitchDone()));
-    this.win.addEventListener("TabSwitched", e => this.safe(() => this.onSwitched(e.detail?.tab)));
+    this.win.addEventListener("TabSwitchDone", live(() => this.onSwitchDone()));
+    this.win.addEventListener("TabSwitched", live(e => this.onSwitched(e.detail?.tab)));
     // Chrome-focus Ctrl+Arrow (URL bar, toolbar). Content focus is TermfoxChild's job.
     this.win.addEventListener("keydown", e => this.safe(() => this.onChromeKeydown(e)), true);
     this.win.addEventListener("unload", () => { this.unloading = true; this.dissolve(); }, { once: true });
@@ -204,10 +231,7 @@ class TermfoxWindow {
       Services.prefs.removeObserver(PREF_STATUSBAR, this.statusObserver);
     }, { once: true });
 
-    if (!Services.prefs.prefHasUserValue(PREF_ENABLED)) {
-      Services.prefs.setBoolPref(PREF_ENABLED, true);
-    }
-    LOG("ready in window; enabled =", this.enabled, "; background-pane painting path =", this.paintPath);
+    LOG("ready in window; paused =", !this.enabled, "; private =", this.private, "; background-pane painting path =", this.paintPath);
   }
 
   safe(fn) {
@@ -252,7 +276,7 @@ class TermfoxWindow {
           reserved: true,
           command: win => termfoxOf(win)?.onHotkey(d.action),
         });
-        // Kill switch stays live even when disabled, so it can toggle back on.
+        // The pause key stays live while paused, so it can resume.
         Promise.resolve(def.attachToWindow(this.win, { suppressOriginal: d.action !== "kill" })).then(
           () => LOG(`hotkey ${d.id} (${Core.comboToString(d.combo)} -> ${d.action}) attached`),
           e => ERR(`hotkey ${d.id} attach failed`, e));
@@ -341,8 +365,12 @@ class TermfoxWindow {
   // t0: when the key was pressed (epoch ms, see now()); defaults to now.
   runAction(action, via, t0 = this.now()) {
     if (action === "kill") {
-      LOG("action kill via", via);
-      return Promise.resolve(this.safe(() => this.toggleKillSwitch())); // never waits behind a stuck job
+      // "kill" is the pause/resume key (action id kept so termfox.keys.kill prefs still work).
+      LOG("action pause/resume via", via);
+      return Promise.resolve(this.safe(() => this.togglePause())); // never waits behind a stuck job
+    }
+    if (!this.enabled) {
+      return Promise.resolve(); // paused
     }
     LOG("action", action, "via", via, this.queue.pending ? `(queued behind ${this.queue.pending})` : "");
     return this.queue.push(action, () => this.timed(action, via, t0));
@@ -364,7 +392,7 @@ class TermfoxWindow {
       if (this.latencies.length > 50) {
         this.latencies.shift();
       }
-      (t.slow ? logger.warn : logger.log).call(logger, t.describe());
+      (t.slow ? WARN : LOG)(t.describe());
       // The layout reaches the screen on the next refresh tick; log when that frame starts.
       // Off the hot path: the queue has already moved on.
       if (t.layout != null && typeof this.win.requestAnimationFrame === "function") {
@@ -404,8 +432,7 @@ class TermfoxWindow {
 
   doAction(action, via) {
     if (!this.enabled) {
-      LOG("action", action, "via", via, "- termfox disabled, ignored");
-      return undefined;
+      return undefined; // paused
     }
     switch (action) {
       case "split-row": return this.split("row");
@@ -425,6 +452,7 @@ class TermfoxWindow {
       case "choose-window": return this.openPanel("windows");
       case "rename-window": return this.openPanel("rename");
       case "kill-window": return this.openPanel("confirm");
+      case "clear-log": return this.clearLog();
     }
     if (action.startsWith("select-window-")) {
       return this.selectIndex(Number(action.slice(14)));
@@ -432,7 +460,12 @@ class TermfoxWindow {
     return undefined;
   }
 
+  // data was checked by Core.validateActorMessage (TermfoxParent): allowlisted action, never
+  // "kill", known via, finite t. It still runs only by spending a trusted press (PressLedger).
   onActorAction(data, browser) {
+    if (!this.enabled || data?.action === "kill") {
+      return;
+    }
     // The content echo can arrive after the press's split already selected a new tab, so it
     // is matched to its press, not to the selected browser (that check dropped fast presses).
     const id = browser?.browserId ?? null;
@@ -452,31 +485,84 @@ class TermfoxWindow {
     this.runAction(data.action, data.via, t0);
   }
 
-  onActorHello(browser, data) {
+  onActorHello(browser) {
     if (!browser || this.actorBrowsers.has(browser)) {
       return;
     }
     this.actorBrowsers.add(browser);
-    LOG(`content actor alive in browser ${browser.browserId} (${data?.where || "?"})`);
+    LOG(`content actor alive in browser ${browser.browserId}`);
   }
 
-  toggleKillSwitch() {
+  // Pause / resume (Ctrl+Alt+Shift+K). Pausing is not an off switch: the privileged scripts
+  // stay loaded until Firefox restarts without them. The off switch is uninstall.ps1.
+  togglePause() {
     const next = !this.enabled;
     Services.prefs.setBoolPref(PREF_ENABLED, next);
     this.win.UC_API.Notifications.show({
       label: next
-        ? "termfox enabled"
-        : "termfox disabled: Firefox keys restored, panes dissolved. Ctrl+Alt+Shift+K turns it back on.",
+        ? "termfox resumed"
+        : "termfox paused: Firefox keys restored, panes dissolved, logging stopped. Ctrl+Alt+Shift+K resumes. To remove termfox, run uninstall.ps1.",
       type: "termfox-kill",
       priority: next ? "info" : "warning",
       window: this.win,
     }).catch(() => {});
   }
 
+  // prefix L: delete termfox.log (+ rotated and pre-rename tilefox logs) from the profile.
+  clearLog() {
+    return Promise.resolve(logger.clear()).then(removed => {
+      this.toast(removed?.length ? `log cleared (${removed.length} file(s) removed)` : "log cleared (no log files)");
+    }, e => {
+      ERR("clear log failed", e);
+      this.toast("could not clear the log (see the Browser Console)");
+    });
+  }
+
+  // While paused only TabClose bookkeeping ran: drop the closed tab and its pane.
+  forgetTab(tab) {
+    const owner = this.ws.ownerOf(tab);
+    const leaf = owner && this.withLayoutOf(owner, () => this.leaves().find(l => l.tab === tab));
+    if (leaf) {
+      this.withLayoutOf(owner, () => this.removeLeaf(leaf));
+    }
+    this.ws.unassign(tab);
+  }
+
+  // After a pause: forget closed tabs, drop windows left without tabs, adopt tabs opened while
+  // paused, and ask content actors that never said hello (tabs opened while paused) to say it.
+  resume() {
+    const live = new Set(this.liveTabs());
+    for (const tab of [...this.ws.owner.keys()]) {
+      if (!live.has(tab)) {
+        this.forgetTab(tab);
+      }
+    }
+    for (const w of [...this.ws.windows]) {
+      if (this.ws.windows.length > 1 && !this.tabsOf(w.id).length) {
+        this.ws.remove(w.id);
+      }
+    }
+    if (!this.ws.get(this.ws.current)) {
+      this.ws.current = this.ws.windows[0]?.id ?? this.ws.add().id;
+    }
+    for (const tab of live) {
+      this.adopt(tab);
+    }
+    for (const tab of live) {
+      const b = tab.linkedBrowser;
+      if (b && !this.actorBrowsers.has(b)) {
+        try { b.browsingContext?.currentWindowGlobal?.getActor("Termfox")?.sendAsyncMessage("Termfox:Ping"); } catch (e) {}
+      }
+    }
+    this.persist();
+  }
+
   onEnabledChanged() {
     if (!this.enabled) {
       this.closePanel();
       this.dissolve();
+    } else {
+      this.resume();
     }
     // Disabled: every tab is shown. Enabled again: only the current window's tabs.
     this.applyVisibility();
@@ -644,7 +730,7 @@ class TermfoxWindow {
     this.applyVisibility();
     this.apply();
     this.persistNow();
-    LOG(`windows restored (${why}): ${this.ws.windows.length} window(s): ${this.statusText()}`);
+    LOG(`windows restored (${why}): ${this.ws.windows.length} window(s)`);
   }
 
   // The saved tab value; falls back to the one written under the old tilefox name.
@@ -653,8 +739,9 @@ class TermfoxWindow {
     return SS.getCustomTabValue(tab, Core.TAB_VALUE) || SS.getCustomTabValue(tab, Core.LEGACY_TAB_VALUE);
   }
 
+  // Private windows keep their windows (names, layouts) in memory only.
   writeTabValue(tab) {
-    if (!this.restored || this.unloading) {
+    if (!this.restored || this.unloading || this.private) {
       return;
     }
     try {
@@ -673,7 +760,7 @@ class TermfoxWindow {
   }
 
   persistNow() {
-    if (!this.restored || this.unloading) {
+    if (!this.restored || this.unloading || this.private) {
       return;
     }
     try {
@@ -751,7 +838,7 @@ class TermfoxWindow {
       this.switching = false;
     }
     this.apply();
-    LOG(`window ${prev === id ? "stays" : "->"} ${w.index}:${this.nameOf(w)} (${this.tabsOf(id).length} tab(s)); ${this.statusText()}`);
+    LOG(`window ${prev === id ? "stays" : "->"} ${w.index} (${this.tabsOf(id).length} tab(s), ${this.ws.windows.length} window(s))`);
     // Focus once the tab switch is done (an event, not a timer); at once if the tab didn't change.
     const focus = () => this.safe(() => {
       if (gb.selectedTab !== target) {
@@ -801,7 +888,7 @@ class TermfoxWindow {
     name = name.trim().slice(0, 32);
     w.name = name;
     w.auto = !name; // empty name: back to automatic naming
-    LOG(`rename window ${w.index} -> ${name || "(automatic)"}`);
+    LOG(`rename window ${w.index} -> ${name ? "custom name" : "automatic name"}`); // never the name itself
     this.updateStatus();
     this.persist();
   }
@@ -816,7 +903,7 @@ class TermfoxWindow {
       return;
     }
     const tabs = this.tabsOf(id).filter(t => !t.pinned);
-    LOG(`kill window ${w.index}:${this.nameOf(w)} (${tabs.length} tab(s))`);
+    LOG(`kill window ${w.index} (${tabs.length} tab(s))`);
     if (id === this.ws.current) {
       this.selectWindow(this.ws.get(this.ws.last) && this.ws.last !== id ? this.ws.last : this.ws.step(1));
     }
@@ -1257,20 +1344,25 @@ class TermfoxWindow {
   // Capture-phase keydown on the chrome window: runs before Firefox's <key> handlers and
   // before the event is forwarded to web content.
   onChromeKeydown(e) {
-    if (!e.ctrlKey && !e.altKey) {
+    // Synthetic (untrusted) events never drive termfox.
+    if (!e.isTrusted || (!e.ctrlKey && !e.altKey)) {
       return;
     }
     const b = Core.bindingFor(this.keyMap, e);
     if (!b) {
       return;
     }
+    if (!this.enabled && b.action !== "kill") {
+      return; // paused: only the resume key, and nothing is logged
+    }
     // A held key: arrows keep moving focus (tmux bind -r); any other key must not add panes.
     // Repeats are still taken (preventDefault) so Firefox's own Ctrl+H / Alt+H don't fire.
     const repeat = e.repeat && !ARROW_KEYS.has(e.key);
     const keyName = Core.comboToString(b.combo);
     const t = e.composedTarget || e.target;
-    const where = t?.localName === "browser" ? `browser ${t.browserId}` : `<${t?.localName || "?"}${t?.id ? "#" + t.id : ""}>`;
-    const decide = msg => LOG(`key ${keyName} (code ${e.code}${repeat ? ", repeat" : ""}) at ${where} -> ${msg}`);
+    // The binding's name and a coarse target only: never e.key, e.code or element names.
+    const where = t?.localName === "browser" ? `browser ${t.browserId}` : "chrome";
+    const decide = msg => LOG(`key ${keyName}${repeat ? " (repeat)" : ""} at ${where} -> ${msg}`);
     const browser = t?.localName === "browser" ? t : t?.closest?.("browser");
     const browserId = browser?.browserId ?? null;
     const take = (why, via = "keydown") => {
@@ -1285,10 +1377,7 @@ class TermfoxWindow {
     };
 
     if (b.action === "kill") {
-      return take("kill switch");
-    }
-    if (!this.enabled) {
-      return decide("pass through (termfox disabled)");
+      return take("pause/resume");
     }
     const chromeEditable = !browser && this.chromeEditable(t);
     const { verdict, why } = Core.routeChromeKey(b, {
@@ -1301,9 +1390,9 @@ class TermfoxWindow {
     if (verdict === "take") {
       return take(why, browser && b.typing === "pass" ? "chrome-fallback" : "keydown");
     }
-    if (verdict === "defer") {
-      this.presses.record({ action: b.action, verdict: "defer", browserId, repeat });
-    }
+    // Deferred and passed presses are recorded too: a content actor may only run an action by
+    // spending a press seen here (Core.PressLedger.content, security audit M3).
+    this.presses.record({ action: b.action, verdict, browserId, repeat });
     decide(verdict === "defer" ? `deferred to content actor (${why})` : `pass through (${why})`);
   }
 
@@ -1381,7 +1470,7 @@ class TermfoxWindow {
     const cur = this.ws.get(this.ws.current);
     switch (mode) {
       case "prefix":
-        this.hint.textContent = "termfox  y/h: split  arrows: move  x: unpane  |  c: new window  n/p: next/prev  l: last  0-9  ,: rename  w: windows  &: kill  |  f: palette  r: reload  Esc";
+        this.hint.textContent = "termfox  y/h: split  arrows: move  x: unpane  |  c: new window  n/p: next/prev  l: last  0-9  ,: rename  w: windows  &: kill  |  f: palette  r: reload  L: clear log  Esc";
         break;
       case "rename":
         this.hint.textContent = `(rename-window) ${cur?.index}: Enter to save, empty = automatic name, Esc to cancel`;
@@ -1413,6 +1502,9 @@ class TermfoxWindow {
   }
 
   onPanelKey(e) {
+    if (!e.isTrusted) {
+      return;
+    }
     if (e.key === "Escape") {
       e.preventDefault();
       this.closePanel();
@@ -1425,7 +1517,7 @@ class TermfoxWindow {
         return; // modifier still held from Ctrl+A / Ctrl+Space
       }
       const action = Core.prefixActionFor(e);
-      LOG(`prefix key ${e.key} (code ${e.code}) -> ${action || "cancel"}`);
+      LOG(`prefix -> ${action || "cancel"}`); // the action only, never the key pressed
       const inPlace = { palette: "palette", "choose-window": "windows", "rename-window": "rename", "kill-window": "confirm" }[action];
       if (inPlace && this.enabled) {
         // switch mode in place (re-opening a panel that is still hiding is unreliable)
@@ -1433,7 +1525,7 @@ class TermfoxWindow {
         this.setMode(inPlace);
         return;
       }
-      this.closePanel(!action || action === "unpane" || action === "reload");
+      this.closePanel(!action || action === "unpane" || action === "reload" || action === "clear-log");
       if (action) {
         this.runAction(action, "prefix");
       }
@@ -1446,7 +1538,7 @@ class TermfoxWindow {
         return;
       }
       const yes = e.key === "y" || e.key === "Y";
-      LOG(`kill-window confirm: ${e.key} -> ${yes ? "kill" : "cancel"}`);
+      LOG(`kill-window confirm -> ${yes ? "kill" : "cancel"}`);
       this.closePanel(!yes);
       if (yes) {
         this.killWindow(this.confirmId);
@@ -1482,9 +1574,13 @@ class TermfoxWindow {
 
   // rank: 0 panes of the current window, 1 termfox windows, 2 tabs of the current window,
   // 3 tabs of other termfox windows, 4+ anything in other Firefox windows.
+  // Private and normal Firefox windows never list each other's windows or tabs.
   allItems(windowsOnly = false) {
     const items = [];
     for (const w of Services.wm.getEnumerator("navigator:browser")) {
+      if (w !== this.win && isPrivateWindow(w) !== this.private) {
+        continue;
+      }
       const t = termfoxOf(w);
       const other = w !== this.win;
       for (const tw of t?.ws.windows || []) {
@@ -1670,7 +1766,8 @@ function migratePrefs() {
   };
   win.addEventListener("error", e => {
     if (String(e.filename || "").includes("termfox")) {
-      ERR("uncaught", e.error || e.message, `${e.filename}:${e.lineno}`);
+      // Through the error formatter (redacted message), never the raw message string.
+      ERR("uncaught", e.error || { name: "Error", message: String(e.message), stack: "" }, Core.redactText(`${e.filename}:${e.lineno}`));
     }
   });
   // gBrowser is not safe to touch until the window has finished loading:

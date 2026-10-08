@@ -27,7 +27,7 @@ try {
 }
 
 try {
-  log.log(`startup: Firefox ${Services.appinfo.version} (build ${Services.appinfo.appBuildID}), log file ${log.path}`);
+  log.log(`startup: Firefox ${Services.appinfo.version}`); // no profile path in the log
   ChromeUtils.registerWindowActor("Termfox", {
     parent: {
       esModuleURI: "chrome://userscripts/content/termfox/TermfoxParent.sys.mjs",

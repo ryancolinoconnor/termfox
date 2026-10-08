@@ -159,13 +159,100 @@ export const KEYMAP = [
 // After the prefix (tmux: C-a <key>). Letters match with or without Ctrl still held.
 // Window keys are tmux's defaults (Ryan's tmux.conf doesn't rebind them): c n p l 0-9 , w &.
 // tmux's p is previous-window, so the palette moved to f (tmux find-window).
+// L (Shift+L) deletes termfox's diagnostic log files.
 export const PREFIX_KEYS = {
-  y: "split-row", h: "split-col", r: "reload", f: "palette", x: "unpane",
+  y: "split-row", h: "split-col", r: "reload", f: "palette", x: "unpane", L: "clear-log",
   ArrowLeft: "focus-left", ArrowRight: "focus-right", ArrowUp: "focus-up", ArrowDown: "focus-down",
   c: "new-window", n: "next-window", p: "previous-window", l: "last-window",
   ",": "rename-window", w: "choose-window", "&": "kill-window",
   ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => [String(n), `select-window-${n}`])),
 };
+
+// Actions a content actor may ask for: the key map's actions, never "kill" (pause/resume is
+// chrome-only). Prefs rebind combos, not actions, so this set is fixed.
+export const CONTENT_ACTIONS = new Set(KEYMAP.map(b => b.action).filter(a => a !== "kill"));
+export const CONTENT_VIA = new Set(["content", "content-fallback"]);
+// Fixed event codes a content actor may log (Termfox:Log). No free text crosses the boundary.
+export const CONTENT_LOG_EVENTS = new Set(["pass-typing", "pass-not-pane", "take", "repeat", "error"]);
+
+const isPlainObject = v => !!v && typeof v === "object" && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+const hasOnlyKeys = (o, allowed) => Object.keys(o).every(k => allowed.includes(k));
+
+/**
+ * Parent-side schema check for a message from the content actor (TermfoxParent). The sender is
+ * a content process, so every field is untrusted. Returns {ok: true, msg} with a clean copy, or
+ * {ok: false, why} (why is one of a few fixed strings, safe to log).
+ *   Termfox:Hello  {}                                   (no fields)
+ *   Termfox:Action {action, via, t}                     action in CONTENT_ACTIONS, via in CONTENT_VIA, finite t
+ *   Termfox:Log    {ev, action?}                        ev in CONTENT_LOG_EVENTS
+ */
+export function validateActorMessage(name, data) {
+  if (data === undefined || data === null) {
+    data = {};
+  }
+  if (!isPlainObject(data)) {
+    return { ok: false, why: "data is not a plain object" };
+  }
+  switch (name) {
+    case "Termfox:Hello":
+      return Object.keys(data).length ? { ok: false, why: "unexpected hello fields" } : { ok: true, msg: {} };
+    case "Termfox:Action": {
+      if (!hasOnlyKeys(data, ["action", "via", "t"])) {
+        return { ok: false, why: "unexpected action fields" };
+      }
+      if (data.action === "kill") {
+        return { ok: false, why: "kill is chrome-only" };
+      }
+      if (typeof data.action !== "string" || data.action.length > 32 || !CONTENT_ACTIONS.has(data.action)) {
+        return { ok: false, why: "action not allowed" };
+      }
+      if (typeof data.via !== "string" || !CONTENT_VIA.has(data.via)) {
+        return { ok: false, why: "via not allowed" };
+      }
+      if (typeof data.t !== "number" || !Number.isFinite(data.t)) {
+        return { ok: false, why: "timestamp not finite" };
+      }
+      return { ok: true, msg: { action: data.action, via: data.via, t: data.t } };
+    }
+    case "Termfox:Log": {
+      if (!hasOnlyKeys(data, ["ev", "action"])) {
+        return { ok: false, why: "unexpected log fields" };
+      }
+      if (typeof data.ev !== "string" || !CONTENT_LOG_EVENTS.has(data.ev)) {
+        return { ok: false, why: "log event not allowed" };
+      }
+      if (data.action !== undefined && (typeof data.action !== "string" || !CONTENT_ACTIONS.has(data.action))) {
+        return { ok: false, why: "log action not allowed" };
+      }
+      return { ok: true, msg: { ev: data.ev, action: data.action ?? null } };
+    }
+  }
+  return { ok: false, why: "unknown message" };
+}
+
+/** Token bucket: allow() is true at most `burst` times at once, refilling `perSec` per second. */
+export class RateLimiter {
+  constructor({ burst = 20, perSec = 5, now = () => Date.now() } = {}) {
+    this.burst = burst;
+    this.perSec = perSec;
+    this.now = now;
+    this.tokens = burst;
+    this.last = now();
+    this.dropped = 0;
+  }
+
+  allow() {
+    const t = this.now();
+    this.tokens = Math.min(this.burst, this.tokens + ((t - this.last) / 1000) * this.perSec);
+    this.last = t;
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return true;
+    }
+    this.dropped++;
+    return false;
+  }
+}
 
 export const KEY_PREF_BRANCH = "termfox.keys.";
 export const keyPref = id => KEY_PREF_BRANCH + id;
@@ -352,29 +439,44 @@ export class PressLedger {
     return { run: true, why: "the keydown listener did not see this press" };
   }
 
-  /** A content actor asks for an action. via: "content" (pass-when-typing key) | "content-fallback". */
+  /**
+   * A content actor asks for an action. via: "content" (pass-when-typing key) | "content-fallback".
+   *
+   * Authorization (security audit M3, 2026-10-08): content runs an action only by spending a
+   * press the parent saw itself. The chrome window's capture keydown listener sees every
+   * trusted keydown aimed at a remote <browser> in the parent process before it is forwarded to
+   * content, and records it here with that browser's id, the bound action and its verdict
+   * ("defer", "pass" or "take"). So a real press always has a record, and a message from a
+   * compromised content process can only consume a press the user made, on the same browser,
+   * for the same action, within ttlMs, once. A "pass" record counts: chrome passes a key when it
+   * cannot check editability (no hello yet), and the actor, which can, may then take it.
+   * Requests with no matching record are refused (they used to run as "the chrome listener
+   * missed this press").
+   */
   content(action, browserId, via) {
     this.prune();
-    const open = this.presses.filter(p => !p.matched && !p.repeat && p.action === action);
-    if (via === "content-fallback") {
-      const taken = open.find(p => p.verdict === "take");
-      if (taken) {
-        taken.matched = true;
-        return { run: false, why: `duplicate of press #${taken.seq} (chrome already ran it)` };
+    const open = this.presses.filter(p => !p.matched && !p.repeat && p.action === action && p.browserId === browserId && browserId != null);
+    const spend = (p, run, why) => {
+      p.matched = true;
+      return { run, why };
+    };
+    if (via !== "content-fallback") {
+      // A pass-when-typing key: the press chrome deferred (or passed) to this browser's actor.
+      const deferred = open.find(p => p.verdict === "defer");
+      if (deferred) {
+        return spend(deferred, true, `press #${deferred.seq} was deferred to content`);
       }
-      return { run: true, why: "the chrome listener missed this press" };
     }
-    const deferred = open.find(p => p.verdict === "defer" && p.browserId === browserId);
-    if (deferred) {
-      deferred.matched = true;
-      return { run: true, why: `press #${deferred.seq} was deferred to content` };
-    }
-    const taken = open.find(p => p.verdict === "take" && p.browserId === browserId);
+    // Chrome already ran it (an "always" key, or the chrome fallback before the actor said hello).
+    const taken = open.find(p => p.verdict === "take");
     if (taken) {
-      taken.matched = true;
-      return { run: false, why: `duplicate of press #${taken.seq} (the chrome fallback already ran it)` };
+      return spend(taken, false, `duplicate of press #${taken.seq} (chrome already ran it)`);
     }
-    return { run: true, why: "no chrome record of this press" };
+    const passed = via !== "content-fallback" && open.find(p => p.verdict === "pass");
+    if (passed) {
+      return spend(passed, true, `press #${passed.seq} was passed to content, which took it`);
+    }
+    return { run: false, why: "no trusted press seen by the parent for this browser and action", refused: true };
   }
 }
 
@@ -895,39 +997,110 @@ export function isEditable(el, doc) {
 
 export const LOG_FILE = "termfox.log";
 export const LOG_MAX_BYTES = 1024 * 1024;
+// Files "clear log" deletes: ours, plus the pre-rename log (it held window names and paths).
+export const LOG_FILES_TO_CLEAR = [LOG_FILE, LOG_FILE + ".1", "tilefox.log", "tilefox.log.1"];
+export const PREF_DEBUG_LOG = "termfox.debugLog"; // file log on/off; off by default
+export const PREF_ENABLED = "termfox.enabled";    // false = paused
+export const LOG_ARG_MAX = 300;
+export const LOG_LINE_MAX = 2000;
+
+/*
+ * Privacy rules for the log (security audit M1/M2, 2026-10-08). Callers log action ids, coarse
+ * outcomes and timings only: never e.key / typed characters, page origins or hosts, tab titles,
+ * window names, or content-supplied strings. The logger enforces what it can on top:
+ *   - every string argument has control characters replaced and is cut to LOG_ARG_MAX
+ *   - errors are reduced to their name, a redacted message, and stack frames whose URLs are
+ *     kept only for chrome:// / resource:// / moz-src:// (others become a bare file name)
+ *   - redactText() removes quoted strings, URLs, file paths, e-mail addresses and long numbers
+ *   - nothing is written to disk while paused, while termfox.debugLog is false, or for a
+ *     private-browsing context ({private: true}, see forContext)
+ */
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+
+export function sanitizeLogText(s, max = LOG_ARG_MAX) {
+  s = String(s).replace(CONTROL_CHARS, "?");
+  return s.length > max ? s.slice(0, max) + "…" : s;
+}
+
+export function redactText(s) {
+  return String(s)
+    .replace(/"[^"]*"|'[^']*'|`[^`]*`/g, "<str>")
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s)]*/gi, m => (/^(chrome|resource|moz-src):\/\//i.test(m) ? m : "<url>"))
+    .replace(/\b[A-Za-z]:[\\/][^\s)]*/g, "<path>")
+    .replace(/(^|[\s(=])\/(?:home|Users|mnt|root|tmp|var|private)\/[^\s)]*/g, "$1<path>")
+    .replace(/\\\\[^\s)]+/g, "<path>")
+    .replace(/[\w.+-]+@[\w-]+\.[\w.-]+/g, "<email>")
+    .replace(/\d{6,}/g, "<num>");
+}
+
+function redactFrame(line) {
+  // SpiderMonkey "fn@url:line:col"; V8 "at fn (url:line:col)" (node tests).
+  const m = /^(.*?)@(.*):(\d+):(\d+)$/.exec(line.trim())
+    || /^at (?:(\S+) \()?(.*?):(\d+):(\d+)\)?$/.exec(line.trim())?.map((v, i) => (i === 1 ? v || "" : v));
+  if (!m) {
+    return "<frame>";
+  }
+  const fn = /^[\w$.<>/*]{0,80}$/.test(m[1]) ? m[1] : "<fn>";
+  const url = /^(chrome|resource|moz-src):\/\//.test(m[2]) && !/[\s"'`]/.test(m[2])
+    ? m[2]
+    : (m[2].split(/[\\/]/).pop() || "").replace(/[^\w.-]/g, "").slice(0, 60) || "<file>";
+  return `${fn}@${url}:${m[3]}:${m[4]}`;
+}
+
+export function formatError(e) {
+  const name = typeof e?.name === "string" && /^[A-Za-z]{1,40}$/.test(e.name) ? e.name : "Error";
+  const msg = sanitizeLogText(redactText(e?.message ?? ""), 160);
+  const frames = typeof e?.stack === "string" ? e.stack.split("\n").filter(Boolean).slice(0, 12).map(redactFrame) : [];
+  return `${name}: ${msg}${frames.length ? "\n    " + frames.join("\n    ") : ""}`;
+}
 
 export function formatArg(a) {
   if (a instanceof Error || (a && typeof a === "object" && "stack" in a && "message" in a)) {
-    return `${a.name || "Error"}: ${a.message}${a.stack ? "\n" + String(a.stack).trimEnd() : ""}`;
+    return formatError(a);
   }
   if (typeof a === "string") {
-    return a;
+    return sanitizeLogText(a);
   }
-  try {
-    return JSON.stringify(a);
-  } catch (e) {
+  if (typeof a === "number" || typeof a === "boolean" || a == null) {
     return String(a);
   }
+  try {
+    return sanitizeLogText(JSON.stringify(a));
+  } catch (e) {
+    return "<unprintable>";
+  }
+}
+
+/** One log line from arguments: each formatted, joined, cut to LOG_LINE_MAX. */
+export function formatLine(level, args, date) {
+  const body = args.map(formatArg).join(" ");
+  return `${date.toISOString()} ${level} ${body.length > LOG_LINE_MAX ? body.slice(0, LOG_LINE_MAX) + "…" : body}\n`;
 }
 
 /**
  * Append-only log file with one rotation (termfox.log -> termfox.log.1 above maxBytes).
- * io: {writeUTF8(path, text, {mode}), stat(path) -> {size}, move(from, to), exists(path)} (IOUtils subset).
+ * io: {writeUTF8(path, text, {mode}), stat(path) -> {size}, move(from, to), exists(path),
+ *      remove(path, {ignoreAbsent})} (IOUtils subset).
  * Writes are serialized through one promise chain.
+ *   fileEnabled()  write to disk at all (termfox.debugLog and not paused)
+ *   active()       log at all, console included (not paused)
  *
  * Mode must be "appendOrCreate". IOUtils' "append" refuses to create a missing file
  * (dom/chrome-webidl/IOUtils.webidl, WriteMode), so with "append" the very first write failed and
  * no termfox.log ever appeared (the bug up to 2026-10-08). A failed write is now reported loudly
- * to the Browser Console (the first one with the path, then every 50th) and kept in
- * logger.lastError, and onWriteError(e, path) is called once so the window can show it.
+ * to the Browser Console (the first one, then every 50th) and kept in logger.lastError, and
+ * onWriteError(e, path) is called once so the window can show it.
  */
-export function createFileLogger({ io, dir, joinPath, maxBytes = LOG_MAX_BYTES, consoleObj = console, now = () => new Date(), onWriteError = () => {} }) {
+export function createFileLogger({
+  io, dir, joinPath, maxBytes = LOG_MAX_BYTES, consoleObj = console, now = () => new Date(),
+  onWriteError = () => {}, fileEnabled = () => true, active = () => true,
+}) {
   const path = joinPath(dir, LOG_FILE);
   const rotated = joinPath(dir, LOG_FILE + ".1");
   let chain = Promise.resolve();
   let size = null; // bytes, learned from stat on first write
   let failures = 0;
-  const state = { lastError: null, failures: 0 };
+  const state = { lastError: null, failures: 0, written: 0 };
 
   async function rotateIfNeeded(adding) {
     if (size === null) {
@@ -943,20 +1116,25 @@ export function createFileLogger({ io, dir, joinPath, maxBytes = LOG_MAX_BYTES, 
     }
   }
 
-  function write(level, args) {
-    const line = `${now().toISOString()} ${level} ${args.map(formatArg).join(" ")}\n`;
+  function write(level, args, ctx) {
+    // Logger-side private check (the producer checks too): never to disk from a private context.
+    if (ctx?.private || !fileEnabled()) {
+      return chain;
+    }
+    const line = formatLine(level, args, now());
     chain = chain.then(async () => {
       const bytes = new TextEncoder().encode(line).length;
       await rotateIfNeeded(bytes);
       await io.writeUTF8(path, line, { mode: "appendOrCreate" });
       size += bytes;
+      state.written++;
     }).catch(e => {
       failures++;
       state.failures = failures;
       state.lastError = e;
       size = null; // re-stat next time
       if (failures === 1 || failures % 50 === 0) {
-        consoleObj.error(`[termfox] CANNOT WRITE LOG FILE ${path} (failure #${failures}):`, e);
+        consoleObj.error(`[termfox] cannot write the log file (failure #${failures}):`, formatError(e));
       }
       if (failures === 1) {
         try { onWriteError(e, path); } catch (e2) {}
@@ -965,22 +1143,48 @@ export function createFileLogger({ io, dir, joinPath, maxBytes = LOG_MAX_BYTES, 
     return chain;
   }
 
+  function emit(level, method, args, ctx) {
+    if (!active()) {
+      return chain;
+    }
+    consoleObj[method]("[termfox]", args.map(formatArg).join(" "));
+    return write(level, args, ctx);
+  }
+
+  const forContext = ctx => ({
+    log: (...a) => emit("INFO", "log", a, ctx),
+    warn: (...a) => emit("WARN", "warn", a, ctx),
+    error: (...a) => emit("ERROR", "error", a, ctx),
+  });
+
   return {
     path,
     get lastError() { return state.lastError; },
     get failures() { return state.failures; },
+    get written() { return state.written; },
     setOnWriteError(fn) { onWriteError = fn; if (state.lastError) { try { fn(state.lastError, path); } catch (e) {} } },
-    log: (...a) => {
-      consoleObj.log("[termfox]", ...a);
-      return write("INFO", a);
-    },
-    warn: (...a) => {
-      consoleObj.warn("[termfox]", ...a);
-      return write("WARN", a);
-    },
-    error: (...a) => {
-      consoleObj.error("[termfox]", ...a);
-      return write("ERROR", a);
+    ...forContext(null),
+    /** A logger for one context; {private: true} never reaches the disk. */
+    forContext,
+    /** Delete every termfox log file (and the pre-rename tilefox ones). Returns the names removed. */
+    clear() {
+      chain = chain.then(async () => {
+        const removed = [];
+        for (const name of LOG_FILES_TO_CLEAR) {
+          const p = joinPath(dir, name);
+          try {
+            if (await io.exists(p)) {
+              await io.remove(p, { ignoreAbsent: true });
+              removed.push(name);
+            }
+          } catch (e) {
+            consoleObj.error("[termfox] clear log failed:", formatError(e));
+          }
+        }
+        size = 0;
+        return removed;
+      });
+      return chain;
     },
     flush: () => chain,
   };
@@ -1047,19 +1251,28 @@ export function getLogger() {
   /* global IOUtils, PathUtils, Services */
   const parentProcess = typeof Services !== "undefined"
     && Services.appinfo?.processType === Services.appinfo?.PROCESS_TYPE_DEFAULT;
+  const pref = (name, dflt) => { try { return Services.prefs.getBoolPref(name, dflt); } catch (e) { return dflt; } };
+  const active = () => pref(PREF_ENABLED, true); // paused: no logging at all
   if (parentProcess && typeof IOUtils !== "undefined" && typeof PathUtils !== "undefined") {
     sharedLogger = createFileLogger({
       io: IOUtils,
       dir: PathUtils.profileDir,
       joinPath: (...p) => PathUtils.join(...p),
+      active,
+      fileEnabled: () => active() && pref(PREF_DEBUG_LOG, false),
     });
-    console.log(`[termfox] file log: ${sharedLogger.path}`);
   } else {
+    const quiet = () => Promise.resolve();
+    const consoleOnly = ctx => ({
+      log: (...a) => (active() ? console.log("[termfox]", a.map(formatArg).join(" ")) : undefined, quiet()),
+      warn: (...a) => (active() ? console.warn("[termfox]", a.map(formatArg).join(" ")) : undefined, quiet()),
+      error: (...a) => (active() ? console.error("[termfox]", a.map(formatArg).join(" ")) : undefined, quiet()),
+    });
     sharedLogger = {
       path: null,
-      log: (...a) => console.log("[termfox]", ...a),
-      warn: (...a) => console.warn("[termfox]", ...a),
-      error: (...a) => console.error("[termfox]", ...a),
+      ...consoleOnly(null),
+      forContext: consoleOnly,
+      clear: () => Promise.resolve([]),
       flush: () => Promise.resolve(),
       lastError: null,
       failures: 0,
@@ -1067,4 +1280,69 @@ export function getLogger() {
     };
   }
   return sharedLogger;
+}
+
+/** termfox.enabled; false = paused. Reads Services.prefs when present (Firefox), else true. */
+export function isEnabled() {
+  try {
+    return typeof Services === "undefined" || Services.prefs.getBoolPref(PREF_ENABLED, true);
+  } catch (e) {
+    return true;
+  }
+}
+
+// One rate limiter per <browser> for content log events and rejection warnings.
+const limiters = new WeakMap();
+const sharedLimiter = new RateLimiter();
+export function limiterFor(browser) {
+  if (!browser || typeof browser !== "object") {
+    return sharedLimiter;
+  }
+  let l = limiters.get(browser);
+  if (!l) {
+    l = new RateLimiter();
+    limiters.set(browser, l);
+  }
+  return l;
+}
+
+const KNOWN_MESSAGES = new Set(["Termfox:Hello", "Termfox:Action", "Termfox:Log"]);
+
+/**
+ * TermfoxParent's handling of one message, testable without Firefox.
+ *   inst    the window's TermfoxWindow (Core registry) or null
+ *   priv    the sender is a private-browsing context: nothing is logged (producer check;
+ *           the logger refuses private contexts on its own as well)
+ *   limiter RateLimiter for this browser
+ * Returns what happened: "rejected" | "logged" | "no-window" | "hello" | "action".
+ */
+export function routeActorMessage({ name, data, browser, priv, inst, log, limiter }) {
+  const say = priv ? null : log.forContext({ private: false });
+  const bid = Number.isInteger(browser?.browserId) ? browser.browserId : "?";
+  const label = KNOWN_MESSAGES.has(name) ? name : "unknown message";
+  const v = validateActorMessage(name, data);
+  if (!v.ok) {
+    if (say && limiter.allow()) {
+      say.warn(`actor: rejected ${label} from browser ${bid}: ${v.why}`);
+    }
+    return "rejected";
+  }
+  if (name === "Termfox:Log") {
+    if (say && limiter.allow()) {
+      say.log(`[content bid=${bid}] ${v.msg.ev}${v.msg.action ? " " + v.msg.action : ""}`);
+    }
+    return "logged";
+  }
+  if (!inst) {
+    if (say && limiter.allow()) {
+      say.warn(`actor: ${label} from browser ${bid} but no termfox in its window`);
+    }
+    return "no-window";
+  }
+  if (name === "Termfox:Hello") {
+    inst.onActorHello(browser);
+    return "hello";
+  }
+  inst.onActorAction(v.msg, browser);
+  return "action";
 }
