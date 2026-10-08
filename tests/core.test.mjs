@@ -6,6 +6,7 @@ import {
   bindingFor, actionFor, routeChromeKey, routeContentKey, prefixActionFor, keyPref, KEYMAP,
   layoutRects, findNeighbour, fuzzy, isEditable, installPaintHook, createFileLogger,
   WindowSet, serializeLayout, deserializeLayout, autoWindowName, parseTabValue, PREFIX_KEYS,
+  PressLedger, routeChromeKey as routeChrome,
 } from "../profile/chrome/JS/tilefox/TilefoxCore.sys.mjs";
 
 const ev = (key, mods = {}, code) => ({
@@ -501,4 +502,36 @@ test("auto window names and tab values", () => {
   assert.deepEqual(parseTabValue('{"w":"w1","u":"abc"}'), { w: "w1", u: "abc" });
   assert.equal(parseTabValue("not json"), null);
   assert.equal(parseTabValue(""), null);
+});
+
+// ---- one press, one action
+
+test("PressLedger matches each echo to its own press", () => {
+  let t = 0;
+  const L = new PressLedger({ now: () => t, ttlMs: 3000 });
+  // keydown took it; the reserved XUL key fires in the same dispatch: ignored, once
+  L.record({ action: "split-col", verdict: "take" });
+  assert.equal(L.xulKey("split-col").run, false);
+  assert.equal(L.xulKey("split-col").run, true); // a second XUL fire is a press the listener missed
+  // two quick deferred presses: both echoes run, in order, even after the selection moved
+  L.record({ action: "split-col", verdict: "defer", browserId: 7 });
+  L.record({ action: "split-col", verdict: "defer", browserId: 7 });
+  assert.equal(L.content("split-col", 7, "content").run, true);
+  assert.equal(L.content("split-col", 7, "content").run, true);
+  // chrome fallback took it and the page saw it too
+  L.record({ action: "split-row", verdict: "take", browserId: 9 });
+  assert.equal(L.content("split-row", 9, "content").run, false);
+  // repeats never match an echo; XUL repeat is swallowed
+  L.record({ action: "split-col", verdict: "take", repeat: true });
+  assert.equal(L.xulKey("split-col").run, false);
+  // records expire
+  L.record({ action: "split-row", verdict: "take", browserId: 4 });
+  t += 5000;
+  assert.equal(L.content("split-row", 4, "content").run, true);
+});
+
+test("empty chrome text field: Ctrl+H/Y/Arrow are taken, not passed", () => {
+  const ctrlH = b("h", ctrl);
+  assert.equal(routeChrome(ctrlH, { chromeEditable: true, chromeFieldEmpty: false, layoutVisible: true }).verdict, "pass");
+  assert.equal(routeChrome(ctrlH, { chromeEditable: true, chromeFieldEmpty: true, layoutVisible: true }).verdict, "take");
 });

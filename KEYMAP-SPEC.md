@@ -5,7 +5,7 @@ Source: /home/ryano/.tmux.conf. Where a key is bound twice, the last binding win
 | Key | tmux | tilefox behaviour |
 |---|---|---|
 | Ctrl+Y | split-window -h (passes through in vim) | new pane to the RIGHT. Passes through to the page when focus is in an editable field |
-| Ctrl+H | split-window -v (passes through in vim) | new pane BELOW. Passes through when focus is in an editable field |
+| Ctrl+H | split-window -v (passes through in vim) | new pane BELOW. Passes through when focus is in an editable field (an empty chrome field, such as a new pane's URL bar, does not count) |
 | Alt+Y | split-window -h | new pane RIGHT, always (even while typing) |
 | Alt+H | split-window -v | new pane BELOW, always |
 | Ctrl+Left/Right/Up/Down | select-pane L/R/U/D (passes through in vim) | focus the pane in that direction; at the edge it wraps to the far side, picking the pane that overlaps the current column/row most (tmux behaviour); ties go to the leftmost pane (up/down) or topmost (left/right). Passes through when focus is in an editable field (so word-jump works) |

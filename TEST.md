@@ -46,7 +46,9 @@ Then install from AMO into the spike profile: **Vimium**, plus uBlock Origin and
 - [ ] Ctrl+H while typing in a textarea or Gmail compose box does **not** split (passes through, like vim in tmux)
 - [ ] Ctrl+Y while typing in a textarea redoes (type, Ctrl+Z, Ctrl+Y) and does not split
 - [ ] Alt+Y while typing in a textarea splits **right**; Alt+H while typing splits **below**. No letter is typed and the Help menu does not open
-- [ ] Ctrl+H while the URL bar is focused passes through (Firefox may open History there; that is the pass-through). Alt+H there splits
+- [ ] Ctrl+H while the URL bar has text in it passes through (Firefox may open History there; that is the pass-through). Alt+H there splits
+- [ ] Ctrl+H in an **empty** URL bar (a fresh pane) splits
+- [ ] Ctrl+H pressed twice fast makes exactly **3** panes; Alt+H x5 fast makes 6. Holding Ctrl+H or Alt+H makes **one** new pane, not many. `tilefox.log` shows `split col` once per press and `swallowed (key repeat ...)` / `ignored: ...` lines for the extra paths
 - [ ] Three or more panes: Ctrl+Y, then Ctrl+H, then Alt+Y. Every pane renders and none goes blank
 - [ ] The focused pane has a blue frame, and clicking another pane moves the frame
 - [ ] Ctrl+A (on page text) then **x** "unpanes" the focused tab: it stays open as a normal tab and the remaining panes reflow

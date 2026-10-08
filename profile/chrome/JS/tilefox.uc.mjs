@@ -49,7 +49,7 @@
  *   each decision (Core.routeChromeKey).
  * - "Always" keys (Alt+Y/H, Alt+Arrow, Ctrl+Space, Ctrl+Shift+P, kill) are taken here. They are
  *   also fx-autoconfig Hotkeys (reserved="true", original <key>s disabled) as a secondary path;
- *   runAction() dedupes, so a key handled by both paths runs once.
+ *   Core.PressLedger matches each path to the press it came from, so one press runs once.
  *   https://github.com/MrOtherGuy/fx-autoconfig#hotkeys
  * - "Pass when typing" keys (Ctrl+Y/H, Ctrl+Arrow, Ctrl+A) aimed at web content are decided in
  *   the content process by TilefoxChild (editable check) when that browser's actor has said
@@ -94,7 +94,14 @@ class TilefoxWindow {
     this.suppressed = []; // original <key> elements we disabled
     this.ourKeyIds = [];
     this.wiredBrowsers = new WeakSet();
-    this.lastAction = { name: "", t: 0 };
+    // One press -> one action, run one at a time (Core.PressLedger / Core.ActionQueue).
+    this.presses = new Core.PressLedger();
+    this.queue = new Core.ActionQueue({
+      onError: (e, label) => ERR(`action ${label} failed`, e),
+      setTimer: (f, ms) => this.win.setTimeout(f, ms),
+      clearTimer: id => this.win.clearTimeout(id),
+    });
+    this.switchWaitMs = 1500; // longest wait for a tab switch to finish before moving on
     this.actorBrowsers = new WeakSet(); // browsers whose content actor has said hello
     this.paintPath = "none";
     this.loadKeyMap();
@@ -169,7 +176,7 @@ class TilefoxWindow {
     Promise.resolve(SS?.promiseAllWindowsRestored).then(
       () => this.safe(() => this.restoreFromSession("promiseAllWindowsRestored")),
       e => ERR("promiseAllWindowsRestored", e));
-    this.win.addEventListener("TabSwitchDone", () => this.safe(() => this.activatePaneBrowsers()));
+    this.win.addEventListener("TabSwitchDone", () => this.safe(() => this.onSwitchDone()));
     // Chrome-focus Ctrl+Arrow (URL bar, toolbar). Content focus is TilefoxChild's job.
     this.win.addEventListener("keydown", e => this.safe(() => this.onChromeKeydown(e)), true);
     this.win.addEventListener("unload", () => { this.unloading = true; this.dissolve(); }, { once: true });
@@ -233,7 +240,7 @@ class TilefoxWindow {
           modifiers: hk.modifiers,
           key: hk.key,
           reserved: true,
-          command: win => win.Tilefox?.runAction(d.action, "xul-key"),
+          command: win => win.Tilefox?.onHotkey(d.action),
         });
         // Kill switch stays live even when disabled, so it can toggle back on.
         Promise.resolve(def.attachToWindow(this.win, { suppressOriginal: d.action !== "kill" })).then(
@@ -316,56 +323,74 @@ class TilefoxWindow {
   }
 
   // ---------------------------------------------------------------- actions
+  // Every action goes through one queue: a split finishes (tab exists, layout applied, tab
+  // switch done) before the next split, close or focus move starts. Returns the job's promise.
   runAction(action, via) {
-    return this.safe(() => {
-      // Dedupe: the keydown listener, the <key> and the content fallback can all fire on one press.
-      const now = Date.now();
-      if (action === this.lastAction.name && now - this.lastAction.t < 250) {
-        LOG("action", action, "via", via, "- duplicate, ignored");
-        return;
-      }
-      this.lastAction = { name: action, t: now };
-      if (action === "kill") {
-        LOG("action kill via", via);
-        return this.toggleKillSwitch();
-      }
-      if (!this.enabled) {
-        LOG("action", action, "via", via, "- tilefox disabled, ignored");
-        return;
-      }
-      LOG("action", action, "via", via);
-      switch (action) {
-        case "split-row": return this.split("row");
-        case "split-col": return this.split("col");
-        case "focus-left":
-        case "focus-right":
-        case "focus-up":
-        case "focus-down": return this.moveFocus(action.slice(6));
-        case "unpane": return this.unpane(this.gBrowser.selectedTab);
-        case "prefix": return this.openPanel("prefix");
-        case "reload": return this.reload();
-        case "palette": return this.openPanel("palette");
-        case "new-window": return this.newWindow();
-        case "next-window": return this.selectWindow(this.ws.step(1));
-        case "previous-window": return this.selectWindow(this.ws.step(-1));
-        case "last-window": return this.lastWindow();
-        case "choose-window": return this.openPanel("windows");
-        case "rename-window": return this.openPanel("rename");
-        case "kill-window": return this.openPanel("confirm");
-      }
-      if (action.startsWith("select-window-")) {
-        return this.selectIndex(Number(action.slice(14)));
-      }
+    if (action === "kill") {
+      LOG("action kill via", via);
+      return Promise.resolve(this.safe(() => this.toggleKillSwitch())); // never waits behind a stuck job
+    }
+    LOG("action", action, "via", via, this.queue.pending ? `(queued behind ${this.queue.pending})` : "");
+    return this.queue.push(action, () => this.doAction(action, via));
+  }
+
+  idle() {
+    return this.queue.idle();
+  }
+
+  onHotkey(action) {
+    const r = this.presses.xulKey(action);
+    if (!r.run) {
+      LOG(`xul-key ${action} - ignored: ${r.why}`);
+      return;
+    }
+    this.runAction(action, "xul-key");
+  }
+
+  doAction(action, via) {
+    if (!this.enabled) {
+      LOG("action", action, "via", via, "- tilefox disabled, ignored");
       return undefined;
-    });
+    }
+    switch (action) {
+      case "split-row": return this.split("row");
+      case "split-col": return this.split("col");
+      case "focus-left":
+      case "focus-right":
+      case "focus-up":
+      case "focus-down": return this.moveFocus(action.slice(6));
+      case "unpane": return this.unpane(this.gBrowser.selectedTab);
+      case "prefix": return this.openPanel("prefix");
+      case "reload": return this.reload();
+      case "palette": return this.openPanel("palette");
+      case "new-window": return this.newWindow();
+      case "next-window": return this.selectWindow(this.ws.step(1));
+      case "previous-window": return this.selectWindow(this.ws.step(-1));
+      case "last-window": return this.lastWindow();
+      case "choose-window": return this.openPanel("windows");
+      case "rename-window": return this.openPanel("rename");
+      case "kill-window": return this.openPanel("confirm");
+    }
+    if (action.startsWith("select-window-")) {
+      return this.selectIndex(Number(action.slice(14)));
+    }
+    return undefined;
   }
 
   onActorAction(data, browser) {
-    // Only act if the message comes from this window's currently selected browser.
-    if (browser !== this.gBrowser.selectedBrowser) {
-      LOG("actor action", data.action, "from a non-selected browser - ignored");
+    // The content echo can arrive after the press's split already selected a new tab, so it
+    // is matched to its press, not to the selected browser (that check dropped fast presses).
+    const id = browser?.browserId ?? null;
+    if (!browser || !this.gBrowser.getTabForBrowser(browser)) {
+      LOG("actor action", data.action, "from a browser not in this window - ignored");
       return;
     }
+    const r = this.presses.content(data.action, id, data.via);
+    if (!r.run) {
+      LOG(`actor action ${data.action} from browser ${id} - ignored: ${r.why}`);
+      return;
+    }
+    LOG(`actor action ${data.action} from browser ${id}: ${r.why}`);
     this.runAction(data.action, data.via);
   }
 
@@ -868,8 +893,66 @@ class TilefoxWindow {
     const newTab = gb.addTrustedTab("about:newtab", { relatedToCurrent: true, ownerTab: sel });
     const newLeaf = { tab: newTab };
     this.replaceNode(leaf, { dir, a: leaf, b: newLeaf, ratio: 0.5 });
+    LOG(`split ${dir}: pane ${this.paneTabs().indexOf(sel) + 1} -> new pane ${this.paneTabs().indexOf(newTab) + 1} of ${this.paneTabs().length}`);
     gb.selectedTab = newTab; // fires TabSelect -> apply()
     this.apply();
+    return this.settle(newTab, "split");
+  }
+
+  // Resolves once `tab` has its panel, the tab switch to it is done (TabSwitchDone) and the
+  // layout is applied again. Each wait gives up after switchWaitMs, logging which step stalled.
+  async settle(tab, why) {
+    const gb = this.gBrowser;
+    if (!(await this.until(() => tab.closing || (tab.linkedPanel && tab.linkedBrowser)))) {
+      LOG(`${why}: new tab still has no panel after ${this.switchWaitMs} ms; continuing`);
+    }
+    if (gb.selectedTab === tab && !tab.closing && !(await this.switchDone(tab))) {
+      LOG(`${why}: no TabSwitchDone after ${this.switchWaitMs} ms; continuing`);
+    }
+    this.apply();
+  }
+
+  until(cond) {
+    if (cond()) {
+      return Promise.resolve(true);
+    }
+    return new Promise(resolve => {
+      const start = Date.now();
+      const poll = () => {
+        if (cond()) {
+          resolve(true);
+        } else if (Date.now() - start >= this.switchWaitMs) {
+          resolve(false);
+        } else {
+          this.win.setTimeout(poll, 10);
+        }
+      };
+      this.win.setTimeout(poll, 10);
+    });
+  }
+
+  // TabSwitchDone fires on the window when AsyncTabSwitcher has shown the selected tab.
+  switchDone(tab) {
+    if (this.switchedTo === tab) {
+      return Promise.resolve(true);
+    }
+    return new Promise(resolve => {
+      const waiter = { tab, resolve };
+      (this.switchWaiters ||= []).push(waiter);
+      this.win.setTimeout(() => {
+        this.switchWaiters = this.switchWaiters.filter(w => w !== waiter);
+        resolve(false);
+      }, this.switchWaitMs);
+    });
+  }
+
+  onSwitchDone() {
+    const tab = this.gBrowser.selectedTab;
+    this.switchedTo = tab;
+    const ready = (this.switchWaiters || []).filter(w => w.tab === tab);
+    this.switchWaiters = (this.switchWaiters || []).filter(w => w.tab !== tab);
+    ready.forEach(w => w.resolve(true));
+    this.activatePaneBrowsers();
   }
 
   unpane(tab) {
@@ -883,6 +966,7 @@ class TilefoxWindow {
       this.gBrowser.selectedTab = this.leaves()[0].tab;
     }
     this.apply();
+    return this.settle(this.gBrowser.selectedTab, "unpane");
   }
 
   removeLeaf(leaf) {
@@ -1049,7 +1133,11 @@ class TilefoxWindow {
     }
     LOG("focus", dir, "-> pane", this.paneTabs().indexOf(best) + 1);
     this.gBrowser.selectedTab = best;
-    this.win.setTimeout(() => best.linkedBrowser?.focus(), 0);
+    return this.settle(best, "focus").then(() => {
+      if (this.gBrowser.selectedTab === best) {
+        best.linkedBrowser?.focus();
+      }
+    });
   }
 
   // Capture-phase keydown on the chrome window: runs before Firefox's <key> handlers and
@@ -1059,16 +1147,25 @@ class TilefoxWindow {
       return;
     }
     const b = Core.bindingFor(this.keyMap, e);
-    if (!b || (e.repeat && !ARROW_KEYS.has(e.key))) {
+    if (!b) {
       return;
     }
+    // A held key: arrows keep moving focus (tmux bind -r); any other key must not add panes.
+    // Repeats are still taken (preventDefault) so Firefox's own Ctrl+H / Alt+H don't fire.
+    const repeat = e.repeat && !ARROW_KEYS.has(e.key);
     const keyName = Core.comboToString(b.combo);
     const t = e.composedTarget || e.target;
     const where = t?.localName === "browser" ? `browser ${t.browserId}` : `<${t?.localName || "?"}${t?.id ? "#" + t.id : ""}>`;
-    const decide = msg => LOG(`key ${keyName} (code ${e.code}) at ${where} -> ${msg}`);
+    const decide = msg => LOG(`key ${keyName} (code ${e.code}${repeat ? ", repeat" : ""}) at ${where} -> ${msg}`);
+    const browser = t?.localName === "browser" ? t : t?.closest?.("browser");
+    const browserId = browser?.browserId ?? null;
     const take = (why, via = "keydown") => {
       e.preventDefault();
       e.stopPropagation();
+      this.presses.record({ action: b.action, verdict: "take", browserId, repeat });
+      if (repeat) {
+        return decide(`swallowed (key repeat; ${why})`);
+      }
       decide(`${b.action} (${why})`);
       this.runAction(b.action, via);
     };
@@ -1079,17 +1176,26 @@ class TilefoxWindow {
     if (!this.enabled) {
       return decide("pass through (tilefox disabled)");
     }
-    const browser = t?.localName === "browser" ? t : t?.closest?.("browser");
+    const chromeEditable = !browser && this.chromeEditable(t);
     const { verdict, why } = Core.routeChromeKey(b, {
       inContent: !!browser,
       actorAlive: !!browser && this.actorBrowsers.has(browser),
-      chromeEditable: !browser && this.chromeEditable(t),
+      chromeEditable,
+      chromeFieldEmpty: chromeEditable && this.chromeFieldEmpty(),
       layoutVisible: this.layoutVisible(),
     });
     if (verdict === "take") {
       return take(why, browser && b.typing === "pass" ? "chrome-fallback" : "keydown");
     }
+    if (verdict === "defer") {
+      this.presses.record({ action: b.action, verdict: "defer", browserId, repeat });
+    }
     decide(verdict === "defer" ? `deferred to content actor (${why})` : `pass through (${why})`);
+  }
+
+  chromeFieldEmpty() {
+    const el = this.doc.activeElement?.shadowRoot?.activeElement || this.doc.activeElement;
+    return !!el && (el.localName === "input" || el.localName === "textarea") && el.value === "";
   }
 
   chromeEditable(t) {

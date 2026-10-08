@@ -16,7 +16,7 @@ field, editor, URL bar, select or similar, the key goes to the page instead, jus
 | Key | tmux.conf | tilefox |
 |---|---|---|
 | **Ctrl+Y** | `C-y` split-window -h (vim-aware) | New pane to the **right**. While typing, passes through (Ctrl+Y = redo there). |
-| **Ctrl+H** | `C-h` split-window -v (vim-aware) | New pane **below**. While typing, passes through. |
+| **Ctrl+H** | `C-h` split-window -v (vim-aware) | New pane **below**. While typing, passes through. An *empty* text field (such as the URL bar of a fresh pane) doesn't count as typing, so Ctrl+H twice makes three panes. |
 | **Alt+Y** | `M-y` split-window -h | New pane to the **right**, always, even while typing. |
 | **Alt+H** | `M-h` split-window -v | New pane **below**, always. |
 | **Ctrl+←/→/↑/↓** | `C-Left`… select-pane (vim-aware) | Focus the pane in that direction, wrapping at the edge like tmux (Up from the top pane goes to the bottom pane in that column, the leftmost one on a tie). While typing, passes through (word-jump). Only when a pane layout is on screen. |
@@ -116,7 +116,9 @@ installed. Before editing `profiles.ini` it backs the file up to `%TEMP%`.
 
 Run `node --test tests/*.test.mjs`, copy the changed files from `profile\chrome\` into
 `%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\chrome\`, then restart Firefox with `launch-tilefox.cmd`
-(it passes `-purgecaches`, so the startup cache never serves old scripts). Prefix then r applies key prefs and
+(it passes `-purgecaches`, so the startup cache never serves old scripts). Fully quit Firefox first: if it is
+still running, the new scripts don't load and no `tilefox.log` appears (2026-10-08: a session started at 14:02
+was still running the day-1 scripts, which had no file log). Prefix then r applies key prefs and
 the stylesheet live and marks the startup cache stale, but edited `.mjs` files only load after a restart
 (running modules can't be swapped in place). A full `uninstall.ps1` and `install.ps1` also works.
 

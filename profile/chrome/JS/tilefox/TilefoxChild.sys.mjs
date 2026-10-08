@@ -88,6 +88,11 @@ export class TilefoxChild extends JSWindowActorChild {
     }
     event.preventDefault();
     event.stopImmediatePropagation();
+    if (event.repeat && !b.action.startsWith("focus-")) {
+      // A held key: only arrows repeat (tmux bind -r); a held Ctrl+H must not add panes.
+      this.log(`content: ${key} on <${el?.localName || "none"}> -> swallowed (key repeat)`);
+      return;
+    }
     this.log(`content: ${key} on <${el?.localName || "none"}> -> ${b.action} (${why})`);
     this.sendAsyncMessage("Tilefox:Action", { action: b.action, via: b.typing === "take" ? "content-fallback" : "content" });
   }

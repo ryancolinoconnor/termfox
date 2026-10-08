@@ -221,6 +221,7 @@ const isFocusAction = a => a.startsWith("focus-");
  *   inContent      the keydown is headed into a <browser> (web content)
  *   actorAlive     that browser's content actor has said hello (it can check editability)
  *   chromeEditable focus is in a chrome text field (URL bar, search bar, palette input)
+ *   chromeFieldEmpty that field holds no text
  *   layoutVisible  a pane layout is on screen
  * Returns {verdict: "take"|"pass"|"defer", why}. "defer" = let the content actor decide.
  */
@@ -239,8 +240,13 @@ export function routeChromeKey(b, ctx) {
       ? { verdict: "pass", why: "no content actor seen, cannot check typing; passing through" }
       : { verdict: "take", why: "chrome fallback: no content actor seen" };
   }
-  if (ctx.chromeEditable) {
+  if (ctx.chromeEditable && !ctx.chromeFieldEmpty) {
     return { verdict: "pass", why: "typing in a chrome text field" };
+  }
+  if (ctx.chromeEditable) {
+    // A fresh pane's about:newtab focuses its empty URL bar; Ctrl+H there must split again,
+    // not open the History sidebar. An empty field has nothing to word-jump or redo.
+    return { verdict: "take", why: "chrome text field is empty" };
   }
   return { verdict: "take", why: "not typing" };
 }
@@ -270,6 +276,115 @@ export function prefixActionFor(ev) {
   return PREFIX_KEYS[ev.key] || PREFIX_KEYS[(ev.key || "").toLowerCase()]
     || (/^Key[A-Z]$/.test(ev.code || "") ? PREFIX_KEYS[ev.code.slice(3).toLowerCase()] : undefined)
     || (/^(Digit|Numpad)[0-9]$/.test(ev.code || "") && !ev.shiftKey ? PREFIX_KEYS[ev.code.slice(-1)] : undefined) || null;
+}
+
+// ---------------------------------------------------------------- one press, one action
+
+/**
+ * One key press can reach tilefox by up to three paths: the chrome window's capture keydown
+ * listener (always first), the reserved XUL <key> of an fx-autoconfig Hotkey (same dispatch,
+ * after the listener), and the content actor (async IPC, which can arrive after later presses).
+ * The ledger records what the keydown listener decided for each press, and each echo from the
+ * other paths is matched to its press. This replaces a 250 ms "same action" window, which
+ * dropped a fast second press and ran a slow content echo twice.
+ */
+export class PressLedger {
+  constructor({ now = () => Date.now(), ttlMs = 3000 } = {}) {
+    this.now = now;
+    this.ttlMs = ttlMs;
+    this.presses = [];
+    this.seq = 0;
+  }
+
+  /** verdict: "take" (chrome ran it) | "defer" (content actor decides) | "pass". */
+  record({ action, verdict, browserId = null, repeat = false }) {
+    this.prune();
+    const p = { seq: ++this.seq, action, verdict, browserId, repeat, t: this.now(), matched: false, xulSeen: false };
+    this.presses.push(p);
+    return p;
+  }
+
+  prune() {
+    const cut = this.now() - this.ttlMs;
+    this.presses = this.presses.filter(p => p.t >= cut);
+  }
+
+  /** The reserved XUL <key> fired. It runs in the same dispatch as the keydown listener. */
+  xulKey(action) {
+    const p = this.presses[this.presses.length - 1];
+    if (p && p.action === action && !p.xulSeen && (p.verdict === "take" || p.repeat)) {
+      p.xulSeen = true;
+      return { run: false, why: p.repeat ? `key repeat of press #${p.seq}` : `press #${p.seq} already ran from the keydown listener` };
+    }
+    return { run: true, why: "the keydown listener did not see this press" };
+  }
+
+  /** A content actor asks for an action. via: "content" (pass-when-typing key) | "content-fallback". */
+  content(action, browserId, via) {
+    this.prune();
+    const open = this.presses.filter(p => !p.matched && !p.repeat && p.action === action);
+    if (via === "content-fallback") {
+      const taken = open.find(p => p.verdict === "take");
+      if (taken) {
+        taken.matched = true;
+        return { run: false, why: `duplicate of press #${taken.seq} (chrome already ran it)` };
+      }
+      return { run: true, why: "the chrome listener missed this press" };
+    }
+    const deferred = open.find(p => p.verdict === "defer" && p.browserId === browserId);
+    if (deferred) {
+      deferred.matched = true;
+      return { run: true, why: `press #${deferred.seq} was deferred to content` };
+    }
+    const taken = open.find(p => p.verdict === "take" && p.browserId === browserId);
+    if (taken) {
+      taken.matched = true;
+      return { run: false, why: `duplicate of press #${taken.seq} (the chrome fallback already ran it)` };
+    }
+    return { run: true, why: "no chrome record of this press" };
+  }
+}
+
+/**
+ * Runs actions one at a time. A job may be async (a split waits for its tab and the tab switch);
+ * the next job starts only when it settles, or after timeoutMs so one stuck job can't wedge keys.
+ */
+export class ActionQueue {
+  constructor({ timeoutMs = 4000, onError = () => {}, setTimer, clearTimer } = {}) {
+    this.timeoutMs = timeoutMs;
+    this.onError = onError;
+    this.setTimer = setTimer || ((f, ms) => setTimeout(f, ms));
+    this.clearTimer = clearTimer || (id => clearTimeout(id));
+    this.tail = Promise.resolve();
+    this.pending = 0;
+  }
+
+  push(label, fn) {
+    this.pending++;
+    const run = async () => {
+      let timer;
+      try {
+        await Promise.race([
+          Promise.resolve().then(fn),
+          new Promise((_, reject) => {
+            timer = this.setTimer(() => reject(new Error(`${label} still running after ${this.timeoutMs} ms; moving on`)), this.timeoutMs);
+          }),
+        ]);
+      } catch (e) {
+        try { this.onError(e, label); } catch (e2) {}
+      } finally {
+        this.clearTimer(timer);
+        this.pending--;
+      }
+    };
+    this.tail = this.tail.then(run);
+    return this.tail;
+  }
+
+  /** Resolves when every queued job has finished. */
+  idle() {
+    return this.tail;
+  }
 }
 
 // ---------------------------------------------------------------- layout geometry

@@ -27,7 +27,9 @@ function el(tag = "div") {
   };
 }
 
-function fakeFirefox({ saved = null } = {}) {
+// asyncTabs: a new tab's panel appears `tabDelay` ms after addTrustedTab, and every tab switch
+// finishes (TabSwitchDone) `switchDelay` ms after selection, like AsyncTabSwitcher.
+function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1 } = {}) {
   const prefs = new Map();
   const tcListeners = {};
   const winListeners = {};
@@ -44,6 +46,7 @@ function fakeFirefox({ saved = null } = {}) {
       if (this._sel) { this._sel.selected = false; }
       this._sel = t; t.selected = true;
       emit(tcListeners, "TabSelect", t);
+      setTimeout(() => { if (this._sel === t) { emit(winListeners, "TabSwitchDone", win); } }, switchDelay);
     },
     get selectedBrowser() { return this._sel?.linkedBrowser; },
     get visibleTabs() { return this.tabs.filter(t => !t.hidden && !t.closing); },
@@ -52,9 +55,10 @@ function fakeFirefox({ saved = null } = {}) {
     addTrustedTab(url, { label } = {}) {
       const n = nextTab++;
       const tab = { id: n, label: label || `tab${n}`, hidden: false, pinned: false, closing: false, selected: false,
-        successor: null, linkedPanel: `panel${n}`,
+        successor: null, linkedPanel: tabDelay ? null : `panel${n}`,
         linkedBrowser: { browserId: n, currentURI: { host: label ? `${label}.example.com` : "" }, focus() {}, docShellIsActive: false } };
       this.tabs.push(tab);
+      if (tabDelay) { setTimeout(() => { tab.linkedPanel = `panel${n}`; }, tabDelay); }
       emit(tcListeners, "TabOpen", tab);
       return tab;
     },
@@ -124,7 +128,7 @@ async function boot(opts) {
   }
   const T = ff.win.Tilefox;
   assert.ok(T, "tilefox booted");
-  const run = async a => { T.lastAction = { name: "", t: 0 }; T.runAction(a, "test"); await tick(); };
+  const run = async a => { await T.runAction(a, "test"); await tick(); };
   const visible = () => ff.gb.tabs.filter(t => !t.hidden).map(t => t.label);
   return { ...ff, T, run, visible, status: () => T.statusText() };
 }
@@ -245,4 +249,122 @@ test("palette lists windows as window:name and jumps into hidden windows", silen
   assert.equal(f.gb.selectedTab.label, "mail");
   assert.deepEqual(f.visible(), ["mail"]);
   assert.ok(f.T.allItems(true).every(i => i.wid)); // prefix w: windows only
+}));
+
+// ---- splits are serialized and one press makes one pane (Ryan 2026-10-08: "Ctrl+H twice
+// in quick succession kinda breaks it")
+
+const shape = n => (n.tab ? n.tab.label : `${n.dir}(${shape(n.a)},${shape(n.b)})`);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function settled(T) {
+  // Content echoes queue more jobs after a delay; wait until the queue stays empty.
+  for (let i = 0; i < 50; i++) {
+    await T.idle();
+    await sleep(20);
+    if (!T.queue.pending) { return; }
+  }
+  throw new Error("queue never drained");
+}
+function keyEvent(key, mods, target, { repeat = false } = {}) {
+  const e = { key, code: "Key" + key.toUpperCase(), ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, ...mods,
+    repeat, target, composedTarget: target, prevented: false, isComposing: false };
+  e.preventDefault = () => { e.prevented = true; };
+  e.stopPropagation = () => {};
+  return e;
+}
+const browserEl = tab => Object.assign(tab.linkedBrowser, { localName: "browser", closest: () => null });
+
+test("stress: 5 back-to-back splits with async tabs run one at a time into one clean tree", silence(async () => {
+  const f = await boot({ tabDelay: 15, switchDelay: 20 });
+  const starts = [];
+  const split = f.T.split.bind(f.T);
+  f.T.split = dir => {
+    const sel = f.gb.selectedTab;
+    starts.push({ sel: sel.label, panel: !!sel.linkedPanel, switched: f.T.switchedTo === sel });
+    return split(dir);
+  };
+  for (let i = 0; i < 5; i++) {
+    f.T.runAction("split-col", "test"); // no await: all five fired at once
+  }
+  assert.equal(f.T.queue.pending, 5);
+  await settled(f.T);
+  assert.equal(shape(f.T.root), "col(mail,col(tab1,col(tab2,col(tab3,col(tab4,tab5)))))");
+  assert.deepEqual(starts.map(s => s.sel), ["mail", "tab1", "tab2", "tab3", "tab4"]);
+  // each split started only after the previous new tab had its panel and its tab switch finished
+  assert.ok(starts.slice(1).every(s => s.panel && s.switched), JSON.stringify(starts));
+  assert.equal(f.gb.selectedTab.label, "tab5");
+  assert.equal(f.gb.tabs.length, 6);
+  const area = [...f.T.rects().values()].reduce((s, r) => s + r.w * r.h, 0);
+  assert.ok(Math.abs(area - 100 * 100) < 1e-6, "panes tile the whole window");
+}));
+
+test("stress: 5 presses through every key path (keydown, XUL key, content echo, repeats) make exactly 5 panes", silence(async () => {
+  const f = await boot({ tabDelay: 10, switchDelay: 15 });
+  const T = f.T;
+  const mail = browserEl(f.gb.tabs[0]);
+  const ctrlH = (opts) => T.onChromeKeydown(keyEvent("h", { ctrlKey: true }, mail, opts));
+  const altH = (opts) => { T.onChromeKeydown(keyEvent("h", { altKey: true }, mail, opts)); T.onHotkey("split-col"); };
+  const echo = (ms, via = "content") => setTimeout(() => T.onActorAction({ action: "split-col", via }, mail), ms);
+
+  ctrlH(); // 1: content actor not seen yet -> chrome fallback takes it
+  echo(2); //    ...and the page saw the key too: duplicate, ignored
+  T.onActorHello(mail, { where: "https://mail" });
+  ctrlH(); // 2: deferred to the content actor; its echo arrives after presses 3 and 4
+  echo(12);
+  altH(); // 3: keydown listener takes it; the reserved XUL key fires too: ignored
+  altH({ repeat: true }); // held Alt+H: swallowed, and its XUL key too
+  ctrlH({ repeat: true }); // held Ctrl+H: content swallows repeats, no echo
+  altH(); // 4
+  ctrlH(); // 5: deferred, echo arrives late
+  echo(25);
+  echo(30, "content-fallback"); // an "always" key echo for press 4 that reached content: ignored
+
+  await sleep(40);
+  await settled(T);
+  assert.equal(T.paneTabs().length, 6, shape(T.root));
+  assert.equal(shape(T.root), "col(mail,col(tab1,col(tab2,col(tab3,col(tab4,tab5)))))");
+  assert.equal(f.gb.selectedTab.label, "tab5");
+}));
+
+test("a fast second Ctrl+H from the old pane's page still splits (echo arrives after the new tab is selected)", silence(async () => {
+  const f = await boot({ switchDelay: 30 });
+  const T = f.T;
+  const mail = browserEl(f.gb.tabs[0]);
+  T.onActorHello(mail, {});
+  T.onChromeKeydown(keyEvent("h", { ctrlKey: true }, mail));
+  T.onActorAction({ action: "split-col", via: "content" }, mail);
+  await sleep(5); // first split has selected tab1, but focus is still in mail's page
+  T.onChromeKeydown(keyEvent("h", { ctrlKey: true }, mail));
+  T.onActorAction({ action: "split-col", via: "content" }, mail); // used to be dropped: "non-selected browser"
+  await settled(T);
+  assert.equal(shape(T.root), "col(mail,col(tab1,tab2))");
+}));
+
+test("Ctrl+H in an empty URL bar splits; with text in it, it passes through", silence(async () => {
+  const f = await boot();
+  const T = f.T;
+  const urlbar = { localName: "input", id: "urlbar-input", value: "", closest: () => null };
+  f.win.document.activeElement = urlbar;
+  const e1 = keyEvent("h", { ctrlKey: true }, urlbar);
+  T.onChromeKeydown(e1);
+  await settled(T);
+  assert.ok(e1.prevented);
+  assert.equal(T.paneTabs().length, 2);
+  urlbar.value = "github.com/ryan";
+  const e2 = keyEvent("h", { ctrlKey: true }, urlbar);
+  T.onChromeKeydown(e2);
+  await settled(T);
+  assert.ok(!e2.prevented, "typing in the URL bar keeps Firefox's Ctrl+H");
+  assert.equal(T.paneTabs().length, 2);
+}));
+
+test("a stuck action can't wedge the queue", silence(async () => {
+  const f = await boot();
+  f.T.queue.timeoutMs = 30;
+  f.T.runAction("split-col", "test");
+  f.T.split = () => new Promise(() => {}); // never settles
+  f.T.runAction("split-col", "test");
+  const after = f.T.runAction("new-window", "test");
+  await after;
+  assert.equal(f.T.ws.windows.length, 2);
 }));
