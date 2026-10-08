@@ -148,12 +148,23 @@ export const KEYMAP = [
   { id: "prefixAlways",     combo: "Ctrl+Space", action: "prefix",      typing: "take", tmux: "(tilefox alias for the prefix)" },
   { id: "palette",          combo: "Ctrl+Shift+P", action: "palette",   typing: "take", tmux: "(tilefox only)" },
   { id: "kill",             combo: "Ctrl+Alt+Shift+K", action: "kill",  typing: "take", tmux: "(tilefox only)" },
+  // Windows (tmux windows inside one Firefox window). No-prefix quick keys; the tmux defaults
+  // are on the prefix (PREFIX_KEYS). Alt+digits are free on Windows: Firefox 157 binds tab
+  // selection to Alt+1..9 only on Linux (XP_GNOME), elsewhere to Ctrl+1..9 (browser-sets.inc.xhtml).
+  { id: "lastWindow",       combo: "Alt+L",      action: "last-window", typing: "take", tmux: "(quick key for prefix l, last-window)" },
+  ...[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => (
+    { id: `selectWindow${n}`, combo: `Alt+${n}`, action: `select-window-${n}`, typing: "take", tmux: `(quick key for prefix ${n}, select-window -t ${n})` })),
 ];
 
 // After the prefix (tmux: C-a <key>). Letters match with or without Ctrl still held.
+// Window keys are tmux's defaults (Ryan's tmux.conf doesn't rebind them): c n p l 0-9 , w &.
+// tmux's p is previous-window, so the palette moved to f (tmux find-window).
 export const PREFIX_KEYS = {
-  y: "split-row", h: "split-col", r: "reload", p: "palette", x: "unpane",
+  y: "split-row", h: "split-col", r: "reload", f: "palette", x: "unpane",
   ArrowLeft: "focus-left", ArrowRight: "focus-right", ArrowUp: "focus-up", ArrowDown: "focus-down",
+  c: "new-window", n: "next-window", p: "previous-window", l: "last-window",
+  ",": "rename-window", w: "choose-window", "&": "kill-window",
+  ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => [String(n), `select-window-${n}`])),
 };
 
 export const KEY_PREF_BRANCH = "tilefox.keys.";
@@ -257,7 +268,8 @@ export function prefixActionFor(ev) {
     return null;
   }
   return PREFIX_KEYS[ev.key] || PREFIX_KEYS[(ev.key || "").toLowerCase()]
-    || (/^Key[A-Z]$/.test(ev.code || "") ? PREFIX_KEYS[ev.code.slice(3).toLowerCase()] : undefined) || null;
+    || (/^Key[A-Z]$/.test(ev.code || "") ? PREFIX_KEYS[ev.code.slice(3).toLowerCase()] : undefined)
+    || (/^(Digit|Numpad)[0-9]$/.test(ev.code || "") && !ev.shiftKey ? PREFIX_KEYS[ev.code.slice(-1)] : undefined) || null;
 }
 
 // ---------------------------------------------------------------- layout geometry
@@ -337,6 +349,194 @@ export function fuzzy(q, text) {
     ti = idx + 1;
   }
   return score;
+}
+
+// ---------------------------------------------------------------- windows (tmux windows)
+
+export const WINDOWS_VALUE = "tilefox-windows"; // SessionStore window value: the WindowSet as JSON
+export const TAB_VALUE = "tilefox-tab";         // SessionStore tab value: {w: window id, u: tab uid}
+
+export const randomId = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+
+/** Layout tree -> plain JSON with tab uids ({t} | {d, r, a, b}). */
+export function serializeLayout(node, uidOf) {
+  if (!node) {
+    return null;
+  }
+  if (node.tab) {
+    return { t: uidOf(node.tab) };
+  }
+  return { d: node.dir, r: node.ratio, a: serializeLayout(node.a, uidOf), b: serializeLayout(node.b, uidOf) };
+}
+
+/** JSON -> layout tree. Missing tabs drop out and their sibling takes their place. */
+export function deserializeLayout(obj, tabOf) {
+  if (!obj || typeof obj !== "object") {
+    return null;
+  }
+  if ("t" in obj) {
+    const tab = tabOf(obj.t);
+    return tab ? { tab } : null;
+  }
+  const a = deserializeLayout(obj.a, tabOf);
+  const b = deserializeLayout(obj.b, tabOf);
+  if (!a || !b) {
+    return a || b;
+  }
+  return { dir: obj.d === "col" ? "col" : "row", a, b, ratio: typeof obj.r === "number" ? obj.r : 0.5 };
+}
+
+/** tmux automatic-rename stand-in: first host label ("mail.google.com" -> "mail"), else the tab title. */
+export function autoWindowName(host, label) {
+  const h = (host || "").replace(/^www\d*\./, "");
+  const name = h ? h.split(".")[0] : (label || "").trim();
+  return (name || "new").slice(0, 16);
+}
+
+/**
+ * The tmux windows of one Firefox window. Tabs are opaque keys, so node tests can use strings.
+ * A window: {id, index, name, auto, root, active}. root = pane layout tree (or null),
+ * active = the tab to show when switching back. Indices start at 0 (tmux base-index 0) and
+ * stay put when another window is killed (tmux default, no renumber-windows).
+ */
+export class WindowSet {
+  constructor({ newId = randomId } = {}) {
+    this.windows = [];
+    this.current = null;
+    this.last = null;
+    this.owner = new Map(); // tab -> window id
+    this.newId = newId;
+  }
+
+  get(id) {
+    return this.windows.find(w => w.id === id) || null;
+  }
+
+  byIndex(i) {
+    return this.windows.find(w => w.index === i) || null;
+  }
+
+  freeIndex() {
+    let i = 0;
+    while (this.byIndex(i)) {
+      i++;
+    }
+    return i;
+  }
+
+  add({ id, index, name = "", root = null } = {}) {
+    const w = { id: id ?? this.newId(), index: index ?? this.freeIndex(), name, auto: !name, root, active: null };
+    this.windows.push(w);
+    this.windows.sort((a, b) => a.index - b.index);
+    this.current ??= w.id;
+    return w;
+  }
+
+  /** Make id current; the previous current becomes "last" (tmux last-window). */
+  select(id) {
+    if (!this.get(id) || id === this.current) {
+      return false;
+    }
+    if (this.get(this.current)) {
+      this.last = this.current;
+    }
+    this.current = id;
+    return true;
+  }
+
+  /** Remove a window (its tabs lose their owner). If it was current, last (else next) takes over. */
+  remove(id) {
+    const i = this.windows.findIndex(w => w.id === id);
+    if (i < 0) {
+      return this.current;
+    }
+    this.windows.splice(i, 1);
+    for (const [tab, w] of this.owner) {
+      if (w === id) {
+        this.owner.delete(tab);
+      }
+    }
+    if (this.current === id) {
+      this.current = this.get(this.last)?.id ?? (this.windows[i] || this.windows[i - 1] || null)?.id ?? null;
+      this.last = null;
+    } else if (this.last === id) {
+      this.last = null;
+    }
+    return this.current;
+  }
+
+  /** Next (+1) / previous (-1) window by index, wrapping (tmux next-window / previous-window). */
+  step(dir) {
+    const n = this.windows.length;
+    if (!n) {
+      return null;
+    }
+    const i = this.windows.findIndex(w => w.id === this.current);
+    return this.windows[((i < 0 ? 0 : i) + dir + n) % n].id;
+  }
+
+  assign(tab, id) {
+    this.owner.set(tab, id);
+  }
+
+  unassign(tab) {
+    this.owner.delete(tab);
+  }
+
+  ownerOf(tab) {
+    return this.owner.get(tab) ?? null;
+  }
+
+  tabsOf(id, allTabs) {
+    return allTabs.filter(t => this.owner.get(t) === id);
+  }
+
+  /** tmux status line: "0:mail  1:dev*  2:docs-" (* current, - last). */
+  status() {
+    return this.windows.map(w => `${w.index}:${w.name}${w.id === this.current ? "*" : w.id === this.last ? "-" : ""}`).join("  ");
+  }
+
+  toJSON(uidOf) {
+    return {
+      v: 1,
+      current: this.current,
+      last: this.last,
+      windows: this.windows.map(w => ({
+        id: w.id, index: w.index, name: w.auto ? "" : w.name,
+        layout: serializeLayout(w.root, uidOf), active: w.active ? uidOf(w.active) : null,
+      })),
+    };
+  }
+
+  /** Rebuild from toJSON() output. tabOf(uid) -> live tab or null. Tab ownership is restored separately. */
+  static fromJSON(data, tabOf, opts) {
+    const ws = new WindowSet(opts);
+    const used = new Set();
+    for (const w of Array.isArray(data?.windows) ? data.windows : []) {
+      if (typeof w?.id !== "string" || ws.get(w.id)) {
+        continue;
+      }
+      const index = Number.isInteger(w.index) && w.index >= 0 && !used.has(w.index) ? w.index : undefined;
+      const nw = ws.add({ id: w.id, index, name: typeof w.name === "string" ? w.name : "" });
+      used.add(nw.index);
+      const root = deserializeLayout(w.layout, tabOf);
+      nw.root = root && !root.tab ? root : null; // a single pane is just a tab
+      nw.active = w.active ? tabOf(w.active) : null;
+    }
+    ws.current = ws.get(data?.current) ? data.current : (ws.windows[0]?.id ?? null);
+    ws.last = ws.get(data?.last) && data.last !== ws.current ? data.last : null;
+    return ws;
+  }
+}
+
+/** Parse a TAB_VALUE string -> {w, u} or null. */
+export function parseTabValue(str) {
+  try {
+    const v = JSON.parse(str || "null");
+    return v && typeof v.u === "string" ? { w: typeof v.w === "string" ? v.w : null, u: v.u } : null;
+  } catch (e) {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------- background-pane painting
@@ -455,13 +655,21 @@ export function formatArg(a) {
 /**
  * Append-only log file with one rotation (tilefox.log -> tilefox.log.1 above maxBytes).
  * io: {writeUTF8(path, text, {mode}), stat(path) -> {size}, move(from, to), exists(path)} (IOUtils subset).
- * Writes are serialized through one promise chain; failures go to the console only.
+ * Writes are serialized through one promise chain.
+ *
+ * Mode must be "appendOrCreate". IOUtils' "append" refuses to create a missing file
+ * (dom/chrome-webidl/IOUtils.webidl, WriteMode), so with "append" the very first write failed and
+ * no tilefox.log ever appeared (the bug up to 2026-10-08). A failed write is now reported loudly
+ * to the Browser Console (the first one with the path, then every 50th) and kept in
+ * logger.lastError, and onWriteError(e, path) is called once so the window can show it.
  */
-export function createFileLogger({ io, dir, joinPath, maxBytes = LOG_MAX_BYTES, consoleObj = console, now = () => new Date() }) {
+export function createFileLogger({ io, dir, joinPath, maxBytes = LOG_MAX_BYTES, consoleObj = console, now = () => new Date(), onWriteError = () => {} }) {
   const path = joinPath(dir, LOG_FILE);
   const rotated = joinPath(dir, LOG_FILE + ".1");
   let chain = Promise.resolve();
   let size = null; // bytes, learned from stat on first write
+  let failures = 0;
+  const state = { lastError: null, failures: 0 };
 
   async function rotateIfNeeded(adding) {
     if (size === null) {
@@ -482,14 +690,28 @@ export function createFileLogger({ io, dir, joinPath, maxBytes = LOG_MAX_BYTES, 
     chain = chain.then(async () => {
       const bytes = new TextEncoder().encode(line).length;
       await rotateIfNeeded(bytes);
-      await io.writeUTF8(path, line, { mode: "append" });
+      await io.writeUTF8(path, line, { mode: "appendOrCreate" });
       size += bytes;
-    }).catch(e => consoleObj.error("[tilefox] log write failed", e));
+    }).catch(e => {
+      failures++;
+      state.failures = failures;
+      state.lastError = e;
+      size = null; // re-stat next time
+      if (failures === 1 || failures % 50 === 0) {
+        consoleObj.error(`[tilefox] CANNOT WRITE LOG FILE ${path} (failure #${failures}):`, e);
+      }
+      if (failures === 1) {
+        try { onWriteError(e, path); } catch (e2) {}
+      }
+    });
     return chain;
   }
 
   return {
     path,
+    get lastError() { return state.lastError; },
+    get failures() { return state.failures; },
+    setOnWriteError(fn) { onWriteError = fn; if (state.lastError) { try { fn(state.lastError, path); } catch (e) {} } },
     log: (...a) => {
       consoleObj.log("[tilefox]", ...a);
       return write("INFO", a);
@@ -522,6 +744,7 @@ export function getLogger() {
       dir: PathUtils.profileDir,
       joinPath: (...p) => PathUtils.join(...p),
     });
+    console.log(`[tilefox] file log: ${sharedLogger.path}`);
   } else {
     sharedLogger = {
       path: null,
@@ -529,6 +752,9 @@ export function getLogger() {
       warn: (...a) => console.warn("[tilefox]", ...a),
       error: (...a) => console.error("[tilefox]", ...a),
       flush: () => Promise.resolve(),
+      lastError: null,
+      failures: 0,
+      setOnWriteError() {},
     };
   }
   return sharedLogger;

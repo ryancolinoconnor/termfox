@@ -28,6 +28,21 @@
  * - The selected tab is the focused pane. If you select a tab that is not in the layout,
  *   the layout is hidden (suspended) and comes back when you select one of its tabs.
  *
+ * WINDOWS (tmux windows inside this Firefox window; model = Core.WindowSet)
+ * - Every tab belongs to exactly one tilefox window (ws.owner). Each window has its own pane
+ *   layout (window.root). Switching windows shows that window's tabs with gBrowser.showTab(),
+ *   selects its remembered tab, and hides every other window's tabs with gBrowser.hideTab()
+ *   (the same API extensions use; Tabbrowser.sys.mjs in 157). Nothing reloads: hidden tabs keep
+ *   their browsers. Firefox's native tab groups (also in 157) were not used: a collapsed group
+ *   still shows its label in the tab strip and can't hold a pane layout.
+ * - Pinned tabs can't be hidden (hideTab refuses), so they show in every window.
+ * - New tabs (links, Ctrl+T, splits) join the current window (TabOpen). Selecting a tab of
+ *   another window (palette, Firefox picking a tab after a close) switches to that window.
+ * - Persisted with SessionStore: window value "tilefox-windows" (names, indices, layouts by tab
+ *   uid, current/last) and tab value "tilefox-tab" ({w, u}); re-read on SSWindowRestored and
+ *   promiseAllWindowsRestored, and per tab on SSTabRestoring (undo close tab).
+ * - Each Firefox window (Ctrl+N) has its own TilefoxWindow, so its own windows and status bar.
+ *
  * KEYS (mirror ~/.tmux.conf; the table is Core.KEYMAP, overridable with tilefox.keys.<id> prefs)
  * - Primary path: one capture-phase keydown listener on the chrome window. It sees every key
  *   before Firefox's <key> handlers and before the event is forwarded to web content, and logs
@@ -45,6 +60,7 @@
 
 const Core = ChromeUtils.importESModule("chrome://userscripts/content/tilefox/TilefoxCore.sys.mjs");
 const PREF_ENABLED = "tilefox.enabled";
+const PREF_STATUSBAR = "tilefox.statusbar";
 const PREF_KEYS_BRANCH = Core.KEY_PREF_BRANCH;
 const logger = Core.getLogger();
 const LOG = (...a) => logger.log(...a);
@@ -69,7 +85,12 @@ class TilefoxWindow {
     this.win = win;
     this.doc = win.document;
     this.gBrowser = win.gBrowser;
-    this.root = null; // layout tree: {tab} leaf | {dir:"row"|"col", a, b, ratio}
+    // Windows: each has its own layout tree ({tab} leaf | {dir:"row"|"col", a, b, ratio}).
+    this.ws = new Core.WindowSet();
+    this.ws.add();
+    this.uids = new WeakMap(); // tab -> stable uid (persisted in the tab value)
+    this.restored = false; // true once SessionStore data has been read; persist only after that
+    this.layoutId = null; // temporarily point `root` at another window's layout
     this.suppressed = []; // original <key> elements we disabled
     this.ourKeyIds = [];
     this.wiredBrowsers = new WeakSet();
@@ -84,6 +105,28 @@ class TilefoxWindow {
 
   get enabled() {
     return Services.prefs.getBoolPref(PREF_ENABLED, true);
+  }
+
+  // The layout of the current tilefox window (or of layoutId while withLayoutOf runs).
+  get root() {
+    return this.ws.get(this.layoutId ?? this.ws.current)?.root ?? null;
+  }
+
+  set root(v) {
+    const w = this.ws.get(this.layoutId ?? this.ws.current);
+    if (w) {
+      w.root = v;
+    }
+  }
+
+  withLayoutOf(id, fn) {
+    const saved = this.layoutId;
+    this.layoutId = id;
+    try {
+      return fn();
+    } finally {
+      this.layoutId = saved;
+    }
   }
 
   // ---------------------------------------------------------------- setup
@@ -101,24 +144,47 @@ class TilefoxWindow {
     this.defineHotkeys();
     this.buildPanel();
 
+    this.buildStatusBar();
+    logger.setOnWriteError((e, path) => this.notify(`tilefox: cannot write ${path} (${e?.message || e}). Details in the Browser Console (Ctrl+Shift+J).`));
+
     const tc = this.gBrowser.tabContainer;
-    this._onSelect = () => this.safe(() => this.apply());
+    for (const tab of this.gBrowser.tabs) {
+      this.adopt(tab);
+    }
+    this._onSelect = () => this.safe(() => this.onTabSelect());
     this._onClose = e => this.safe(() => this.onTabClose(e.target));
     tc.addEventListener("TabSelect", this._onSelect);
     tc.addEventListener("TabClose", this._onClose);
+    tc.addEventListener("TabOpen", e => this.safe(() => this.onTabOpen(e.target)));
+    tc.addEventListener("TabPinned", () => this.safe(() => this.applyVisibility()));
+    tc.addEventListener("TabUnpinned", () => this.safe(() => this.applyVisibility()));
+    tc.addEventListener("TabAttrModified", e => {
+      if (e.detail?.changed?.includes("label")) {
+        this.safe(() => this.updateStatus());
+      }
+    });
+    tc.addEventListener("SSTabRestoring", e => this.safe(() => this.onTabRestoring(e.target)));
+    this.win.addEventListener("SSWindowRestored", () => this.safe(() => this.restoreFromSession("SSWindowRestored")));
+    const SS = this.win.SessionStore;
+    Promise.resolve(SS?.promiseAllWindowsRestored).then(
+      () => this.safe(() => this.restoreFromSession("promiseAllWindowsRestored")),
+      e => ERR("promiseAllWindowsRestored", e));
     this.win.addEventListener("TabSwitchDone", () => this.safe(() => this.activatePaneBrowsers()));
     // Chrome-focus Ctrl+Arrow (URL bar, toolbar). Content focus is TilefoxChild's job.
     this.win.addEventListener("keydown", e => this.safe(() => this.onChromeKeydown(e)), true);
-    this.win.addEventListener("unload", () => this.dissolve(), { once: true });
+    this.win.addEventListener("unload", () => { this.unloading = true; this.dissolve(); }, { once: true });
 
     this.prefObserver = { observe: () => this.safe(() => this.onEnabledChanged()) };
     Services.prefs.addObserver(PREF_ENABLED, this.prefObserver);
     // Key prefs apply live to the keydown listener; the secondary <key> elements need a restart.
     this.keysObserver = { observe: () => this.safe(() => { this.loadKeyMap(); this.applyKeyState(); }) };
     Services.prefs.addObserver(PREF_KEYS_BRANCH, this.keysObserver);
+    this.statusObserver = { observe: () => this.safe(() => this.updateStatus()) };
+    Services.prefs.addObserver(PREF_STATUSBAR, this.statusObserver);
     this.win.addEventListener("unload", () => {
       Services.prefs.removeObserver(PREF_ENABLED, this.prefObserver);
       Services.prefs.removeObserver(PREF_KEYS_BRANCH, this.keysObserver);
+      Services.prefs.removeObserver(PREF_STATUSBAR, this.statusObserver);
     }, { once: true });
 
     if (!Services.prefs.prefHasUserValue(PREF_ENABLED)) {
@@ -279,6 +345,16 @@ class TilefoxWindow {
         case "prefix": return this.openPanel("prefix");
         case "reload": return this.reload();
         case "palette": return this.openPanel("palette");
+        case "new-window": return this.newWindow();
+        case "next-window": return this.selectWindow(this.ws.step(1));
+        case "previous-window": return this.selectWindow(this.ws.step(-1));
+        case "last-window": return this.lastWindow();
+        case "choose-window": return this.openPanel("windows");
+        case "rename-window": return this.openPanel("rename");
+        case "kill-window": return this.openPanel("confirm");
+      }
+      if (action.startsWith("select-window-")) {
+        return this.selectIndex(Number(action.slice(14)));
       }
       return undefined;
     });
@@ -319,7 +395,401 @@ class TilefoxWindow {
       this.closePanel();
       this.dissolve();
     }
+    // Disabled: every tab is shown. Enabled again: only the current window's tabs.
+    this.applyVisibility();
+    this.updateStatus();
     this.applyKeyState();
+  }
+
+  // ---------------------------------------------------------------- windows
+  isManaged(tab) {
+    return !!tab && !tab.closing && tab !== this.win.FirefoxViewHandler?.tab;
+  }
+
+  uidOf(tab) {
+    let u = this.uids.get(tab);
+    if (!u) {
+      u = Core.randomId();
+      this.uids.set(tab, u);
+    }
+    return u;
+  }
+
+  liveTabs() {
+    return [...this.gBrowser.tabs].filter(t => this.isManaged(t));
+  }
+
+  tabsOf(id) {
+    return this.ws.tabsOf(id, this.liveTabs());
+  }
+
+  // Give an unowned tab to the current window.
+  adopt(tab) {
+    if (this.isManaged(tab) && !this.ws.ownerOf(tab)) {
+      this.ws.assign(tab, this.ws.current);
+      this.writeTabValue(tab);
+    }
+  }
+
+  onTabOpen(tab) {
+    if (!this.ws.get(this.ws.current)) {
+      this.ws.current = this.ws.add().id;
+    }
+    this.adopt(tab);
+    this.guardLastTab();
+    this.updateStatus();
+  }
+
+  // Firefox picks the next tab after a close among VISIBLE tabs only (Tabbrowser
+  // _findTabToBlurTo), but it tries tab.successor first. So when the current window is down to
+  // one tab, its successor is the last window's tab: closing it lands there, like tmux.
+  guardLastTab() {
+    const gb = this.gBrowser;
+    if (this.guarded && this.guarded.tab.successor === this.guarded.fallback && !this.guarded.tab.closing) {
+      gb.setSuccessor(this.guarded.tab, null);
+    }
+    this.guarded = null;
+    if (!this.enabled || typeof gb.setSuccessor !== "function") {
+      return;
+    }
+    const mine = this.tabsOf(this.ws.current).filter(t => !t.pinned);
+    if (mine.length !== 1 || mine[0].successor) {
+      return;
+    }
+    const otherId = this.ws.get(this.ws.last) ? this.ws.last : this.ws.windows.find(w => w.id !== this.ws.current)?.id;
+    const other = this.ws.get(otherId);
+    const members = other ? this.tabsOf(other.id) : [];
+    const fallback = members.includes(other?.active) ? other.active : members[0];
+    if (fallback) {
+      gb.setSuccessor(mine[0], fallback);
+      this.guarded = { tab: mine[0], fallback };
+    }
+  }
+
+  onTabSelect() {
+    const tab = this.gBrowser.selectedTab;
+    const owner = this.ws.ownerOf(tab);
+    if (this.enabled && !this.switching && owner && owner !== this.ws.current && !tab.pinned) {
+      // Deferred: this can run inside Firefox's tab removal (blur to the guard's successor).
+      this.win.setTimeout(() => this.safe(() => {
+        if (this.gBrowser.selectedTab === tab && this.ws.ownerOf(tab) === owner && owner !== this.ws.current) {
+          LOG(`selected a tab of window ${this.ws.get(owner)?.index}: switching to it`);
+          this.selectWindow(owner, { tab });
+        }
+      }), 0);
+      return;
+    }
+    const w = this.ws.get(owner);
+    if (w && owner === this.ws.current) {
+      w.active = tab;
+    }
+    this.apply();
+  }
+
+  // Undo close tab / restored tabs: rejoin their old window if it still exists.
+  onTabRestoring(tab) {
+    if (!this.restored || !this.isManaged(tab)) {
+      return;
+    }
+    const v = Core.parseTabValue(this.win.SessionStore.getCustomTabValue(tab, Core.TAB_VALUE));
+    if (v) {
+      const clash = this.liveTabs().some(t => t !== tab && this.uids.get(t) === v.u); // duplicated tab
+      this.uids.set(tab, clash ? Core.randomId() : v.u);
+      if (v.w && this.ws.get(v.w)) {
+        this.ws.assign(tab, v.w);
+      }
+    }
+    this.adopt(tab);
+    this.writeTabValue(tab);
+    this.applyVisibility();
+    this.updateStatus();
+  }
+
+  // Rebuild the windows from SessionStore (startup, Ctrl+Shift+N "reopen closed window", restore session).
+  restoreFromSession(why) {
+    const SS = this.win.SessionStore;
+    if (!SS || this.unloading) {
+      return;
+    }
+    let data = null;
+    try {
+      data = JSON.parse(SS.getCustomWindowValue(this.win, Core.WINDOWS_VALUE) || "null");
+    } catch (e) {
+      ERR("windows: bad saved window value, starting fresh", e);
+    }
+    const values = new Map();
+    const seen = new Set();
+    for (const tab of this.liveTabs()) {
+      const v = Core.parseTabValue(SS.getCustomTabValue(tab, Core.TAB_VALUE));
+      if (v && !seen.has(v.u)) {
+        seen.add(v.u);
+        this.uids.set(tab, v.u);
+        values.set(tab, v);
+      }
+    }
+    if (data?.windows?.length) {
+      for (const t of this.paneTabs()) {
+        this.clearPanel(t);
+      }
+      const byUid = new Map([...values].map(([tab, v]) => [v.u, tab]));
+      const ws = Core.WindowSet.fromJSON(data, u => byUid.get(u) || null);
+      if (ws.windows.length) {
+        for (const tab of this.liveTabs()) {
+          const w = values.get(tab)?.w;
+          ws.assign(tab, ws.get(w) ? w : ws.current);
+        }
+        // Windows whose tabs are all gone are dropped.
+        for (const w of [...ws.windows]) {
+          if (!ws.tabsOf(w.id, this.liveTabs()).length && ws.windows.length > 1) {
+            ws.remove(w.id);
+          }
+        }
+        this.ws = ws;
+      }
+    }
+    // What's on screen wins: the restored selected tab decides the current window.
+    const selOwner = this.ws.ownerOf(this.gBrowser.selectedTab);
+    if (selOwner && selOwner !== this.ws.current) {
+      this.ws.select(selOwner);
+    }
+    this.restored = true;
+    for (const tab of this.liveTabs()) {
+      this.writeTabValue(tab);
+    }
+    this.applyVisibility();
+    this.apply();
+    this.persistNow();
+    LOG(`windows restored (${why}): ${this.ws.windows.length} window(s): ${this.statusText()}`);
+  }
+
+  writeTabValue(tab) {
+    if (!this.restored || this.unloading) {
+      return;
+    }
+    try {
+      this.win.SessionStore.setCustomTabValue(tab, Core.TAB_VALUE, JSON.stringify({ w: this.ws.ownerOf(tab), u: this.uidOf(tab) }));
+    } catch (e) {
+      ERR("windows: setCustomTabValue failed", e);
+    }
+  }
+
+  persist() {
+    if (!this.restored || this.unloading) {
+      return;
+    }
+    this.win.clearTimeout(this.persistTimer);
+    this.persistTimer = this.win.setTimeout(() => this.safe(() => this.persistNow()), 150);
+  }
+
+  persistNow() {
+    if (!this.restored || this.unloading) {
+      return;
+    }
+    try {
+      this.win.SessionStore.setCustomWindowValue(this.win, Core.WINDOWS_VALUE, JSON.stringify(this.ws.toJSON(t => this.uidOf(t))));
+    } catch (e) {
+      ERR("windows: setCustomWindowValue failed", e);
+    }
+  }
+
+  // Show the current window's tabs (and pinned ones), hide the rest. Disabled: show everything.
+  applyVisibility() {
+    const gb = this.gBrowser;
+    const selOwner = this.ws.ownerOf(gb.selectedTab);
+    if (this.enabled && selOwner && selOwner !== this.ws.current && !gb.selectedTab.pinned) {
+      this.ws.select(selOwner);
+    }
+    for (const tab of this.liveTabs()) {
+      const owner = this.ws.ownerOf(tab);
+      if (!this.enabled || !owner || owner === this.ws.current || tab.pinned) {
+        if (tab.hidden && !this.win.SessionStore?.getCustomTabValue(tab, "hiddenBy")) {
+          gb.showTab(tab); // never un-hide a tab an extension hid
+        }
+      } else if (!tab.hidden && !tab.selected) {
+        gb.hideTab(tab);
+      }
+    }
+  }
+
+  // tmux select-window: instant, nothing reloads (tabs are only shown/hidden).
+  selectWindow(id, { tab = null, newTab = false } = {}) {
+    const gb = this.gBrowser;
+    const w = this.ws.get(id);
+    if (!w) {
+      return;
+    }
+    const prev = this.ws.current;
+    this.switching = true;
+    let target;
+    try {
+      if (prev !== id) {
+        // Park the old window's panes: plain hidden tabs until we come back.
+        const old = this.ws.get(prev);
+        if (old && this.ws.ownerOf(gb.selectedTab) === prev) {
+          old.active = gb.selectedTab;
+        }
+        this.withLayoutOf(prev, () => {
+          for (const t of this.paneTabs()) {
+            this.clearPanel(t);
+          }
+        });
+        this.ws.select(id);
+      }
+      let members = this.tabsOf(id);
+      if (!members.length) {
+        // TabOpen gives it to the (new) current window.
+        gb.addTrustedTab(this.win.BROWSER_NEW_TAB_URL || "about:newtab");
+        members = this.tabsOf(id);
+        newTab = true;
+      }
+      target = tab && members.includes(tab) ? tab : members.includes(w.active) ? w.active : members[0];
+      for (const t of members) {
+        gb.showTab(t);
+      }
+      gb.selectedTab = target;
+      w.active = target;
+      this.applyVisibility();
+      for (const t of this.liveTabs()) {
+        const b = t.linkedBrowser;
+        if (t.hidden && b?.docShellIsActive) {
+          try { b.docShellIsActive = false; } catch (e) {}
+        }
+      }
+    } finally {
+      this.switching = false;
+    }
+    this.apply();
+    LOG(`window ${prev === id ? "stays" : "->"} ${w.index}:${this.nameOf(w)} (${this.tabsOf(id).length} tab(s)); ${this.statusText()}`);
+    this.win.setTimeout(() => this.safe(() => {
+      if (newTab) {
+        this.win.gURLBar?.select();
+      } else {
+        gb.selectedBrowser?.focus();
+      }
+    }), 0);
+  }
+
+  newWindow() {
+    const w = this.ws.add();
+    LOG(`new window ${w.index}`);
+    this.selectWindow(w.id, { newTab: true });
+  }
+
+  lastWindow() {
+    if (!this.ws.get(this.ws.last)) {
+      this.toast("no last window");
+      return;
+    }
+    this.selectWindow(this.ws.last);
+  }
+
+  selectIndex(i) {
+    const w = this.ws.byIndex(i);
+    if (!w) {
+      this.toast(`can't find window: ${i}`); // tmux's message
+      return;
+    }
+    this.selectWindow(w.id);
+  }
+
+  renameWindow(name) {
+    const w = this.ws.get(this.ws.current);
+    if (!w) {
+      return;
+    }
+    name = name.trim().slice(0, 32);
+    w.name = name;
+    w.auto = !name; // empty name: back to automatic naming
+    LOG(`rename window ${w.index} -> ${name || "(automatic)"}`);
+    this.updateStatus();
+    this.persist();
+  }
+
+  killWindow(id = this.ws.current) {
+    const w = this.ws.get(id);
+    if (!w) {
+      return;
+    }
+    if (this.ws.windows.length === 1) {
+      this.toast("only one window: close the Firefox window instead (Ctrl+Shift+W)", 2500);
+      return;
+    }
+    const tabs = this.tabsOf(id).filter(t => !t.pinned);
+    LOG(`kill window ${w.index}:${this.nameOf(w)} (${tabs.length} tab(s))`);
+    if (id === this.ws.current) {
+      this.selectWindow(this.ws.get(this.ws.last) && this.ws.last !== id ? this.ws.last : this.ws.step(1));
+    }
+    this.withLayoutOf(id, () => {
+      for (const t of this.paneTabs()) {
+        this.clearPanel(t);
+      }
+    });
+    this.ws.remove(id); // before closing, so TabClose doesn't treat it as an emptied window
+    if (tabs.length) {
+      this.gBrowser.removeTabs(tabs, { animate: false });
+    }
+    this.updateStatus();
+    this.persist();
+  }
+
+  nameOf(w) {
+    if (!w.auto) {
+      return w.name;
+    }
+    const tab = w.id === this.ws.current && this.ws.ownerOf(this.gBrowser.selectedTab) === w.id
+      ? this.gBrowser.selectedTab
+      : (w.active && !w.active.closing ? w.active : this.tabsOf(w.id)[0]);
+    let host = "";
+    try { host = tab?.linkedBrowser?.currentURI?.host || ""; } catch (e) {}
+    return Core.autoWindowName(host, tab?.label);
+  }
+
+  statusText() {
+    for (const w of this.ws.windows) {
+      if (w.auto) {
+        w.name = this.nameOf(w);
+      }
+    }
+    return this.ws.status();
+  }
+
+  // tmux status line (toggle with the tilefox.statusbar pref). Sits under the toolbars.
+  buildStatusBar() {
+    const HTML = "http://www.w3.org/1999/xhtml";
+    const bar = this.doc.createElementNS(HTML, "div");
+    bar.id = "tilefox-status";
+    const toolbox = this.doc.getElementById("navigator-toolbox");
+    (toolbox || this.doc.getElementById("browser")?.parentNode)?.append(bar);
+    bar.addEventListener("click", e => this.safe(() => {
+      const id = e.target?.closest?.("[data-wid]")?.dataset.wid;
+      if (id) {
+        this.selectWindow(id);
+      }
+    }));
+    this.statusBar = bar;
+  }
+
+  updateStatus() {
+    const bar = this.statusBar;
+    if (!bar) {
+      return;
+    }
+    const show = this.enabled && Services.prefs.getBoolPref(PREF_STATUSBAR, true);
+    bar.hidden = !show;
+    if (!show) {
+      return;
+    }
+    this.statusText(); // refresh automatic names
+    const HTML = "http://www.w3.org/1999/xhtml";
+    bar.replaceChildren(...this.ws.windows.map(w => {
+      const span = this.doc.createElementNS(HTML, "span");
+      const flag = w.id === this.ws.current ? "*" : w.id === this.ws.last ? "-" : "";
+      span.textContent = `${w.index}:${w.name}${flag}`;
+      span.dataset.wid = w.id;
+      span.className = "tilefox-win" + (flag === "*" ? " current" : "");
+      span.title = `${this.tabsOf(w.id).length} tab(s). Click, or Alt+${w.index} / prefix ${w.index}`;
+      return span;
+    }));
   }
 
   // ---------------------------------------------------------------- layout tree
@@ -432,12 +902,30 @@ class TilefoxWindow {
   }
 
   onTabClose(tab) {
-    const leaf = this.leaves().find(l => l.tab === tab);
-    if (leaf) {
-      this.removeLeaf(leaf);
-      // Defer: the closing tab's replacement selection happens after TabClose.
-      this.win.setTimeout(() => this.safe(() => this.apply()), 0);
+    if (this.unloading) {
+      return;
     }
+    const owner = this.ws.ownerOf(tab);
+    const leaf = owner && this.withLayoutOf(owner, () => this.leaves().find(l => l.tab === tab));
+    if (leaf) {
+      this.withLayoutOf(owner, () => this.removeLeaf(leaf));
+    }
+    this.ws.unassign(tab);
+    // tmux: closing a window's last tab kills the window and goes to the last one.
+    if (owner && this.ws.get(owner) && !this.tabsOf(owner).filter(t => t !== tab).length) {
+      const wasCurrent = owner === this.ws.current;
+      LOG(`window ${this.ws.get(owner).index} closed its last tab: window gone`);
+      this.ws.remove(owner);
+      if (!this.ws.windows.length) {
+        this.ws.add(); // the Firefox window lives on (closeWindowWithLastTab = false)
+      }
+      if (wasCurrent) {
+        const next = this.ws.current;
+        this.win.setTimeout(() => this.safe(() => this.selectWindow(next)), 0);
+      }
+    }
+    // Defer: the closing tab's replacement selection happens after TabClose.
+    this.win.setTimeout(() => this.safe(() => this.apply()), 0);
   }
 
   dissolve() {
@@ -494,6 +982,9 @@ class TilefoxWindow {
     if (visible) {
       this.activatePaneBrowsers();
     }
+    this.guardLastTab();
+    this.updateStatus();
+    this.persist();
   }
 
   activatePaneBrowsers() {
@@ -652,21 +1143,46 @@ class TilefoxWindow {
     if (this.panel.state === "open") {
       this.closePanel(false);
     }
-    this.mode = mode;
     this.restoreFocusOnHide = true;
-    this.panel.setAttribute("mode", mode);
-    this.input.value = "";
+    this.setMode(mode);
     if (mode === "prefix") {
-      this.hint.textContent = "tilefox  y: split right   h: split down   arrows: move   r: reload   p: palette   x: unpane   Esc";
       this.prefixTimer = this.win.setTimeout(() => this.closePanel(), 2500);
-    } else {
-      this.hint.textContent = "Panes (▣) and tabs. Enter: jump, Esc: close";
-      this.renderPalette();
     }
     const anchor = this.gBrowser.tabpanels;
     const width = mode === "prefix" ? 640 : 560;
     const x = Math.max(0, (anchor.getBoundingClientRect().width - width) / 2);
     this.panel.openPopup(anchor, "overlap", x, 40, false, false);
+  }
+
+  setMode(mode) {
+    this.mode = mode;
+    this.panel.setAttribute("mode", mode);
+    this.input.value = "";
+    const cur = this.ws.get(this.ws.current);
+    switch (mode) {
+      case "prefix":
+        this.hint.textContent = "tilefox  y/h: split  arrows: move  x: unpane  |  c: new window  n/p: next/prev  l: last  0-9  ,: rename  w: windows  &: kill  |  f: palette  r: reload  Esc";
+        break;
+      case "rename":
+        this.hint.textContent = `(rename-window) ${cur?.index}: Enter to save, empty = automatic name, Esc to cancel`;
+        this.input.value = cur && !cur.auto ? cur.name : "";
+        this.input.setAttribute("placeholder", cur ? this.nameOf(cur) : "");
+        this.input.select();
+        break;
+      case "confirm":
+        this.confirmId = this.ws.current;
+        this.hint.textContent = `kill-window ${cur?.index}:${cur ? this.nameOf(cur) : "?"} and close its ${this.tabsOf(this.ws.current).filter(t => !t.pinned).length} tab(s)? (y/n)`;
+        break;
+      case "windows":
+        this.hint.textContent = "Windows. Enter: switch, Esc: close";
+        this.input.setAttribute("placeholder", "window...");
+        this.renderPalette();
+        break;
+      default:
+        this.hint.textContent = "Windows, panes (▣) and tabs. Enter: jump, Esc: close";
+        this.input.setAttribute("placeholder", "jump to window / pane / tab...");
+        this.renderPalette();
+    }
   }
 
   closePanel(restore = true) {
@@ -690,13 +1206,11 @@ class TilefoxWindow {
       }
       const action = Core.prefixActionFor(e);
       LOG(`prefix key ${e.key} (code ${e.code}) -> ${action || "cancel"}`);
-      if (action === "palette") {
+      const inPlace = { palette: "palette", "choose-window": "windows", "rename-window": "rename", "kill-window": "confirm" }[action];
+      if (inPlace && this.enabled) {
         // switch mode in place (re-opening a panel that is still hiding is unreliable)
         this.win.clearTimeout(this.prefixTimer);
-        this.mode = "palette";
-        this.panel.setAttribute("mode", "palette");
-        this.hint.textContent = "Panes (▣) and tabs. Enter: jump, Esc: close";
-        this.renderPalette();
+        this.setMode(inPlace);
         return;
       }
       this.closePanel(!action || action === "unpane" || action === "reload");
@@ -705,7 +1219,30 @@ class TilefoxWindow {
       }
       return;
     }
-    // palette
+    if (this.mode === "confirm") {
+      e.preventDefault();
+      e.stopPropagation();
+      if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) {
+        return;
+      }
+      const yes = e.key === "y" || e.key === "Y";
+      LOG(`kill-window confirm: ${e.key} -> ${yes ? "kill" : "cancel"}`);
+      this.closePanel(!yes);
+      if (yes) {
+        this.killWindow(this.confirmId);
+      }
+      return;
+    }
+    if (this.mode === "rename") {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        const name = this.input.value;
+        this.closePanel();
+        this.renameWindow(name);
+      }
+      return;
+    }
+    // palette / window list
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       const n = this.paletteItems.length;
@@ -723,36 +1260,56 @@ class TilefoxWindow {
     }
   }
 
-  allItems() {
+  // rank: 0 panes of the current window, 1 tilefox windows, 2 tabs of the current window,
+  // 3 tabs of other tilefox windows, 4+ anything in other Firefox windows.
+  allItems(windowsOnly = false) {
     const items = [];
     for (const w of Services.wm.getEnumerator("navigator:browser")) {
       const t = w.Tilefox;
+      const other = w !== this.win;
+      for (const tw of t?.ws.windows || []) {
+        const name = t.nameOf(tw);
+        const n = t.tabsOf(tw.id).length;
+        items.push({
+          win: w, wid: tw.id, rank: other ? 5 : 1,
+          text: `window:${name} ${tw.index}`,
+          label: `window:${name}`,
+          host: `#${tw.index}, ${n} tab${n === 1 ? "" : "s"}${tw.id === t.ws.current ? ", current" : ""}`,
+          other,
+        });
+      }
+      if (windowsOnly) {
+        continue;
+      }
       const panes = t ? t.paneTabs() : [];
       for (const tab of w.gBrowser.tabs) {
-        if (tab.hidden || tab.closing) {
-          continue;
+        const owner = t?.ws.ownerOf(tab);
+        if (tab.closing || (tab.hidden && !owner)) {
+          continue; // hidden by an extension / Firefox View
         }
         const pane = panes.indexOf(tab);
+        const elsewhere = owner && owner !== t.ws.current;
+        const tw = elsewhere ? t.ws.get(owner) : null;
         let host = "";
         try { host = tab.linkedBrowser?.currentURI?.host || ""; } catch (e) {}
         items.push({
           win: w,
           tab,
           pane: pane >= 0 ? pane + 1 : 0,
-          text: `${tab.label} ${host}`,
-          label: tab.label || "(untitled)",
+          rank: (other ? 4 : 0) + (pane >= 0 ? 0 : elsewhere ? 3 : 2),
+          text: `${tab.label} ${host}${tw ? " " + t.nameOf(tw) : ""}`,
+          label: `${tw ? `[${tw.index}:${t.nameOf(tw)}] ` : ""}${tab.label || "(untitled)"}`,
           host,
-          other: w !== this.win,
+          other,
         });
       }
     }
-    // Panes of this window first, then this window's tabs, then other windows.
-    return items.sort((a, b) => (a.other - b.other) || ((b.pane > 0) - (a.pane > 0)));
+    return items.sort((a, b) => a.rank - b.rank);
   }
 
   renderPalette() {
     const q = this.input.value.trim();
-    const scored = this.allItems()
+    const scored = this.allItems(this.mode === "windows")
       .map(it => ({ it, s: Core.fuzzy(q, it.text) }))
       .filter(x => x.s > 0);
     if (q) {
@@ -764,7 +1321,7 @@ class TilefoxWindow {
     const HTML = "http://www.w3.org/1999/xhtml";
     this.paletteItems.forEach((it, i) => {
       const li = this.doc.createElementNS(HTML, "li");
-      li.textContent = `${it.pane ? "▣" + it.pane + " " : ""}${it.label}${it.host ? "  · " + it.host : ""}${it.other ? "  (other window)" : ""}`;
+      li.textContent = `${it.pane ? "▣" + it.pane + " " : ""}${it.label}${it.host ? "  · " + it.host : ""}${it.other ? "  (other Firefox window)" : ""}`;
       li.addEventListener("mousedown", ev => {
         ev.preventDefault();
         this.closePanel(false);
@@ -783,8 +1340,18 @@ class TilefoxWindow {
   }
 
   jumpTo(item) {
-    item.win.gBrowser.selectedTab = item.tab;
+    const t = item.win.Tilefox;
     item.win.focus();
+    if (item.wid) {
+      t?.selectWindow(item.wid);
+      return;
+    }
+    const owner = t?.ws.ownerOf(item.tab);
+    if (owner && owner !== t.ws.current) {
+      t.selectWindow(owner, { tab: item.tab });
+      return;
+    }
+    item.win.gBrowser.selectedTab = item.tab;
     item.win.setTimeout(() => item.tab.linkedBrowser?.focus(), 0);
   }
 

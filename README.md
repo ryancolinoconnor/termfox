@@ -25,8 +25,10 @@ field, editor, URL bar, select or similar, the key goes to the page instead, jus
 | **Ctrl+Space** | (alias) | Prefix, always (also while typing). |
 | prefix then `y` / `h` / arrows | | Split right / split down / move focus |
 | prefix then `r` | `bind r source-file` | Reload: re-reads the keymap prefs and the stylesheet in every window, shows "Reloaded". |
-| prefix then `p` / `x` | | Palette / unpane (turn the focused pane back into a normal tab). Esc cancels. |
-| **Ctrl+Shift+P** | | Fuzzy palette over panes (▣) and tabs in all windows. Replaces "New private window" (use the menu). |
+| prefix then `f` / `x` | `f` find-window | Palette / unpane (turn the focused pane back into a normal tab). Esc cancels. (`p` is now previous-window, as in tmux.) |
+| prefix then `c` `n` `p` `l` `0`–`9` `,` `w` `&` | tmux defaults | **Windows** (below): new, next, previous, last, select by index, rename, list, kill. |
+| **Alt+L** / **Alt+0…9** | | Last window / select window N, no prefix. |
+| **Ctrl+Shift+P** | | Fuzzy palette over tilefox windows (`window:name`), panes (▣) and tabs in all windows. Replaces "New private window" (use the menu). |
 | **Ctrl+Alt+Shift+K** | | Kill switch: toggles `tilefox.enabled`. Off means panes dissolve and Firefox's keys come back. |
 | mouse | `mouse on` | Click a pane to focus it. |
 
@@ -35,12 +37,31 @@ field, editor, URL bar, select or similar, the key goes to the page instead, jus
 - The focused pane (the selected tab) has a blue frame.
 - Selecting a tab that isn't in the layout hides the layout, and selecting one of its tabs brings it back.
 
+### Windows (tmux windows)
+
+Each tilefox window is a named group of tabs with its own pane layout, like a tmux window in a session.
+Switching windows hides the other windows' tabs with `gBrowser.hideTab()` and shows this window's tabs with
+`gBrowser.showTab()`, then reselects the tab you were on, so the layout comes back exactly and nothing
+reloads. (Firefox 157's native tab groups weren't used: a collapsed group still shows in the tab strip and can't
+hold a layout.) A status line under the toolbars reads `0:mail  1:dev*  2:docs-` (`*` current, `-` last);
+click an entry to switch, or set `tilefox.statusbar` = false to hide it.
+
+- New tabs (links, Ctrl+T, splits) join the current window. Closing a window's last tab kills that window and
+  goes to the last one, like tmux.
+- Pinned tabs can't be hidden, so they show in every window.
+- Windows persist across restarts in SessionStore (`setCustomWindowValue` "tilefox-windows" for names, indices
+  and layouts; `setCustomTabValue` "tilefox-tab" for each tab's window). Reopening a closed tab puts it back in
+  its old window.
+- Every Firefox window (Ctrl+N) has its own set of tilefox windows and its own status line.
+- The kill switch shows every tab; turning tilefox back on hides the other windows again.
+
 ### Changing keys
 
 The table lives in one place (`KEYMAP` in `TilefoxCore.sys.mjs`). Override any entry with a string pref in
 `about:config`, `tilefox.keys.<id>`, for example `tilefox.keys.splitRight` = `Ctrl+H`, or `none` to unbind it.
 Ids: `splitRight`, `splitDown`, `splitRightAlways`, `splitDownAlways`, `focusLeft|Right|Up|Down`,
-`focusLeftAlways|RightAlways|UpAlways|DownAlways`, `prefix`, `prefixAlways`, `palette`, `kill`. The keydown listener
+`focusLeftAlways|RightAlways|UpAlways|DownAlways`, `prefix`, `prefixAlways`, `palette`, `kill`, `lastWindow`,
+`selectWindow0` … `selectWindow9`. The keydown listener
 picks changes up at once (or press prefix then r). Restart for the menu-style `<key>` fallback of the "always"
 keys to follow. Bad values fall back to the default and are logged.
 
@@ -48,6 +69,10 @@ keys to follow. Bad values fall back to the default and are logged.
 
 Every `[tilefox]` line (plus caught errors with stacks) is also appended to
 `%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\tilefox.log` (rotates to `tilefox.log.1` at 1 MB).
+The Browser Console prints `[tilefox] file log: <path>` at startup. If a write fails, the console shows
+`[tilefox] CANNOT WRITE LOG FILE <path>` with the error, and the window shows a notification bar once.
+(Before 2026-10-08 no log was ever created: the writer used IOUtils mode `"append"`, which refuses to create a
+missing file. It now uses `"appendOrCreate"`.)
 At startup it records the Firefox version, the background-pane painting path
 (`native-splitViewBrowsers`, `switcher-patch` or `docshell-only`), the key map, each hotkey's
 registration and the actor registration. Every key press that matches the keymap is logged with its decision
@@ -104,14 +129,15 @@ profile/chrome/JS/tilefox_actor.sys.mjs           registers the JSWindowActor on
 profile/chrome/JS/tilefox/TilefoxChild.sys.mjs    content process: is the focus editable? routes Ctrl+Arrow
 profile/chrome/JS/tilefox/TilefoxParent.sys.mjs   forwards actor messages/log lines to the window
 profile/chrome/JS/tilefox/TilefoxCore.sys.mjs     pure helpers: key map, geometry, paint hook, file log
-tests/core.test.mjs                               node --test tests/*.test.mjs
+tests/core.test.mjs                               node --test tests/*.test.mjs (pure helpers)
+tests/windows.test.mjs                            runs tilefox.uc.mjs against a fake gBrowser + SessionStore
 profile/chrome/CSS/tilefox.uc.css                 pane geometry, focus frame, palette
 ```
 
 ## Known limits (spike)
 
-- **Not persisted.** Layouts are lost on restart. There's one layout per window, and splitting a tab outside it
-  starts a new layout.
+- **One layout per tilefox window.** Splitting a tab outside it starts a new layout for that window. Windows and
+  layouts persist across restarts; see "Windows".
 - **No resizing.** Every split is 50/50 and there are no splitters yet.
 - **Firefox-internal APIs.** Panes rely on Firefox internals (present in 157.0.1 and 158): shadowing
   `gBrowser.splitViewBrowsers` so background panes keep painting, plus the `#tabbrowser-tabpanels` deck CSS.

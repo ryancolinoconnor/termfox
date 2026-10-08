@@ -80,7 +80,7 @@
   text-align: center;
 }
 #tilefox-panel[mode="prefix"] .tilefox-box {
-  width: 640px;
+  width: 760px;
 }
 #tilefox-panel .tilefox-hint {
   font-size: 12px;
@@ -96,14 +96,14 @@
   background: #2b2a33;
   color: inherit;
 }
-/* In prefix mode the input only exists to hold keyboard focus. */
-#tilefox-panel[mode="prefix"] .tilefox-input {
+/* In prefix / confirm mode the input only exists to hold keyboard focus. */
+#tilefox-panel:is([mode="prefix"], [mode="confirm"]) .tilefox-input {
   position: absolute;
   opacity: 0;
   width: 1px;
   height: 1px;
 }
-#tilefox-panel[mode="prefix"] .tilefox-list {
+#tilefox-panel:is([mode="prefix"], [mode="confirm"], [mode="rename"]) .tilefox-list {
   display: none;
 }
 #tilefox-panel .tilefox-list {
@@ -124,4 +124,31 @@
 #tilefox-panel .tilefox-list > li[selected] {
   background: #00b3f4;
   color: #000;
+}
+
+/* ---- tmux-style status line: "0:mail  1:dev*  2:docs-" (pref tilefox.statusbar) ---- */
+#tilefox-status {
+  display: flex;
+  gap: 14px;
+  padding: 1px 8px;
+  font: 11px/16px monospace;
+  background: #1c1b22;
+  color: #b8b8c0;
+  border-top: 1px solid #00b3f4;
+  user-select: none;
+}
+#tilefox-status[hidden] {
+  display: none;
+}
+#tilefox-status > .tilefox-win {
+  cursor: pointer;
+  white-space: nowrap;
+}
+#tilefox-status > .tilefox-win.current {
+  color: #000;
+  background: #00b3f4;
+  padding: 0 4px;
+}
+:root[inDOMFullscreen] #tilefox-status {
+  display: none;
 }

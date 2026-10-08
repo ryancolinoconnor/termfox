@@ -5,6 +5,7 @@ import {
   parseCombo, comboToString, comboMatches, comboToHotkey, comboToOriginalKey, resolveKeyMap,
   bindingFor, actionFor, routeChromeKey, routeContentKey, prefixActionFor, keyPref, KEYMAP,
   layoutRects, findNeighbour, fuzzy, isEditable, installPaintHook, createFileLogger,
+  WindowSet, serializeLayout, deserializeLayout, autoWindowName, parseTabValue, PREFIX_KEYS,
 } from "../profile/chrome/JS/tilefox/TilefoxCore.sys.mjs";
 
 const ev = (key, mods = {}, code) => ({
@@ -35,6 +36,8 @@ test("default key map mirrors tmux.conf", () => {
     "Ctrl+Space": "prefix/take", // always-on alias
     "Ctrl+Shift+P": "palette/take",
     "Ctrl+Alt+Shift+K": "kill/take",
+    "Alt+L": "last-window/take", // quick key for prefix l
+    ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => [`Alt+${n}`, `select-window-${n}/take`])),
   });
 });
 
@@ -117,7 +120,8 @@ test("prefix keys: y h arrows r p x, with or without Ctrl held", () => {
   assert.equal(prefixActionFor(ev("y")), "split-row");
   assert.equal(prefixActionFor(ev("\b", ctrl, "KeyH")), "split-col"); // Ctrl+H as backspace char
   assert.equal(prefixActionFor(ev("ArrowUp")), "focus-up");
-  assert.equal(prefixActionFor(ev("p")), "palette");
+  assert.equal(prefixActionFor(ev("p")), "previous-window"); // tmux default; palette moved to f
+  assert.equal(prefixActionFor(ev("f")), "palette");
   assert.equal(prefixActionFor(ev("x")), "unpane");
   assert.equal(prefixActionFor(ev("Control")), null);
   assert.equal(prefixActionFor(ev("q")), null);
@@ -256,7 +260,13 @@ function fakeIO() {
     exists: async p => files.has(p),
     stat: async p => ({ size: new TextEncoder().encode(files.get(p)).length }),
     move: async (a, b) => { files.set(b, files.get(a)); files.delete(a); },
-    writeUTF8: async (p, text, { mode }) => { files.set(p, (mode === "append" ? files.get(p) || "" : "") + text); },
+    // Like IOUtils: "append" refuses to create a missing file, "appendOrCreate" creates it.
+    writeUTF8: async (p, text, { mode }) => {
+      if (mode === "append" && !files.has(p)) {
+        throw new Error(`NotFoundError: Could not open the file at ${p} to append`);
+      }
+      files.set(p, (mode === "append" || mode === "appendOrCreate" ? files.get(p) || "" : "") + text);
+    },
   };
 }
 const quiet = { log() {}, warn() {}, error() {} };
@@ -283,4 +293,159 @@ test("logger rotates at maxBytes", async () => {
   assert.ok(io.files.has("/p/tilefox.log.1"));
   assert.ok(new TextEncoder().encode(io.files.get("/p/tilefox.log")).length <= 200);
   assert.match(io.files.get("/p/tilefox.log"), /line 9/);
+});
+
+test("logger creates the file on first write (regression: IOUtils 'append' never creates it)", async () => {
+  const io = fakeIO();
+  const log = createFileLogger({ io, dir: "/fresh", joinPath: (...p) => p.join("/"), consoleObj: quiet });
+  log.log("first line");
+  await log.flush();
+  assert.match(io.files.get("/fresh/tilefox.log"), /INFO first line/);
+  assert.equal(log.failures, 0);
+});
+
+test("logger surfaces write failures to the console and the window, once", async () => {
+  const errors = [];
+  const seen = [];
+  const io = { ...fakeIO(), writeUTF8: async () => { throw new Error("NotAllowedError: denied"); } };
+  const log = createFileLogger({
+    io, dir: "/ro", joinPath: (...p) => p.join("/"),
+    consoleObj: { log() {}, warn() {}, error: (...a) => errors.push(a.map(String).join(" ")) },
+  });
+  log.setOnWriteError((e, path) => seen.push(path));
+  log.log("a");
+  log.log("b");
+  await log.flush();
+  assert.equal(log.failures, 2);
+  assert.match(String(log.lastError), /denied/);
+  assert.equal(errors.filter(e => e.includes("CANNOT WRITE LOG FILE /ro/tilefox.log")).length, 1);
+  assert.deepEqual(seen, ["/ro/tilefox.log"]);
+});
+
+// ---- windows (tmux windows inside one Firefox window)
+
+test("window prefix keys are tmux's defaults", () => {
+  assert.equal(prefixActionFor(ev("c")), "new-window");
+  assert.equal(prefixActionFor(ev("n")), "next-window");
+  assert.equal(prefixActionFor(ev("p")), "previous-window");
+  assert.equal(prefixActionFor(ev("l")), "last-window");
+  assert.equal(prefixActionFor(ev("w")), "choose-window");
+  assert.equal(prefixActionFor(ev(",", {}, "Comma")), "rename-window");
+  assert.equal(prefixActionFor(ev("&", { shiftKey: true }, "Digit7")), "kill-window");
+  assert.equal(prefixActionFor(ev("0", {}, "Digit0")), "select-window-0");
+  assert.equal(prefixActionFor(ev("7", {}, "Digit7")), "select-window-7");
+  assert.equal(prefixActionFor(ev("3", {}, "Numpad3")), "select-window-3");
+  assert.equal(prefixActionFor(ev("c", ctrl)), "new-window"); // Ctrl still held from Ctrl+A
+  assert.equal(Object.keys(PREFIX_KEYS).filter(k => /^[0-9]$/.test(k)).length, 10);
+});
+
+test("Alt+L and Alt+digits pick windows without the prefix; prefs can rebind them", () => {
+  assert.equal(b("l", alt).action, "last-window");
+  assert.equal(b("3", alt, "Digit3").action, "select-window-3");
+  assert.equal(b("3", ctrl, "Digit3"), null); // Ctrl+3 stays Firefox's tab key on Windows
+  const k = resolveKeyMap(n => ({ [keyPref("lastWindow")]: "Alt+B", [keyPref("selectWindow9")]: "none" })[n] || "");
+  assert.equal(bindingFor(k, ev("b", alt)).action, "last-window");
+  assert.equal(bindingFor(k, ev("l", alt)), null);
+  assert.equal(bindingFor(k, ev("9", alt, "Digit9")), null);
+});
+
+const seq = () => { let i = 0; return () => `w${i++}`; };
+
+test("WindowSet: new, select, last, next/previous, index lookup", () => {
+  const ws = new WindowSet({ newId: seq() });
+  const w0 = ws.add();
+  const w1 = ws.add();
+  const w2 = ws.add({ name: "docs" });
+  assert.deepEqual([w0.index, w1.index, w2.index], [0, 1, 2]);
+  assert.equal(ws.current, "w0");
+  ws.select("w1");
+  assert.equal(ws.last, "w0");
+  ws.select(ws.last); // prefix l toggles back and forth
+  assert.deepEqual([ws.current, ws.last], ["w0", "w1"]);
+  ws.select(ws.last);
+  assert.deepEqual([ws.current, ws.last], ["w1", "w0"]);
+  assert.equal(ws.step(1), "w2");
+  ws.select("w2");
+  assert.equal(ws.step(1), "w0"); // wraps
+  assert.equal(ws.step(-1), "w1");
+  assert.equal(ws.byIndex(2).id, "w2");
+  assert.equal(ws.byIndex(5), null);
+  assert.equal(ws.select("w2"), false); // already current: last unchanged
+  assert.equal(ws.last, "w1");
+});
+
+test("WindowSet: status line marks current * and last -", () => {
+  const ws = new WindowSet({ newId: seq() });
+  ws.add({ name: "mail" });
+  ws.add({ name: "dev" });
+  ws.add({ name: "docs" });
+  ws.select("w1");
+  assert.equal(ws.status(), "0:mail-  1:dev*  2:docs");
+});
+
+test("WindowSet: killing keeps indices (no renumber) and falls back to last", () => {
+  const ws = new WindowSet({ newId: seq() });
+  ws.add(); ws.add(); ws.add();
+  ws.select("w2");
+  ws.select("w1");
+  ws.assign("tabA", "w1");
+  assert.equal(ws.remove("w1"), "w2"); // current killed -> last
+  assert.equal(ws.ownerOf("tabA"), null);
+  assert.equal(ws.last, null);
+  assert.deepEqual(ws.windows.map(w => w.index), [0, 2]);
+  assert.equal(ws.add().index, 1); // lowest free index, like tmux
+  ws.remove("w2"); // no last: the neighbour by index takes over
+  assert.equal(ws.current, "w3");
+});
+
+test("WindowSet: tab membership", () => {
+  const ws = new WindowSet({ newId: seq() });
+  ws.add(); ws.add();
+  ws.assign("a", "w0"); ws.assign("b", "w1"); ws.assign("c", "w0");
+  assert.deepEqual(ws.tabsOf("w0", ["a", "b", "c", "d"]), ["a", "c"]);
+  ws.unassign("a");
+  assert.deepEqual(ws.tabsOf("w0", ["a", "b", "c"]), ["c"]);
+});
+
+test("layouts serialize by tab uid and drop closed tabs", () => {
+  const root = { dir: "row", ratio: 0.5, a: { tab: "A" }, b: { dir: "col", ratio: 0.5, a: { tab: "B" }, b: { tab: "C" } } };
+  const json = serializeLayout(root, t => "u" + t);
+  assert.deepEqual(json, { d: "row", r: 0.5, a: { t: "uA" }, b: { d: "col", r: 0.5, a: { t: "uB" }, b: { t: "uC" } } });
+  const all = { uA: "A", uB: "B", uC: "C" };
+  assert.deepEqual(deserializeLayout(JSON.parse(JSON.stringify(json)), u => all[u] || null), root);
+  // C was closed while Firefox was down: B takes the whole right half
+  assert.deepEqual(deserializeLayout(json, u => ({ uA: "A", uB: "B" })[u] || null),
+    { dir: "row", ratio: 0.5, a: { tab: "A" }, b: { tab: "B" } });
+  assert.equal(deserializeLayout(null, () => null), null);
+});
+
+test("WindowSet round-trips through JSON (SessionStore window value)", () => {
+  const ws = new WindowSet({ newId: seq() });
+  const w0 = ws.add({ name: "mail" });
+  const w1 = ws.add();
+  w1.root = { dir: "row", ratio: 0.5, a: { tab: "A" }, b: { tab: "B" } };
+  w1.active = "B";
+  w0.active = "M";
+  ws.select("w1");
+  const uid = t => "u" + t;
+  const data = JSON.parse(JSON.stringify(ws.toJSON(uid)));
+  const back = WindowSet.fromJSON(data, u => ({ uA: "A", uB: "B", uM: "M" })[u] || null);
+  assert.deepEqual([back.current, back.last], ["w1", "w0"]);
+  assert.equal(back.status(), "0:mail-  1:*"); // auto names are filled in by the window script
+  assert.deepEqual(back.get("w1").root, w1.root);
+  assert.equal(back.get("w1").active, "B");
+  assert.equal(back.get("w0").name, "mail");
+  assert.equal(back.get("w1").auto, true); // auto-named windows keep following their tab
+  // garbage in -> empty set, no throw
+  assert.equal(WindowSet.fromJSON({ windows: [{}, null, { id: 3 }] }, () => null).windows.length, 0);
+});
+
+test("auto window names and tab values", () => {
+  assert.equal(autoWindowName("mail.google.com", "Inbox"), "mail");
+  assert.equal(autoWindowName("www.github.com", "x"), "github");
+  assert.equal(autoWindowName("", "New Tab"), "New Tab");
+  assert.equal(autoWindowName("", ""), "new");
+  assert.deepEqual(parseTabValue('{"w":"w1","u":"abc"}'), { w: "w1", u: "abc" });
+  assert.equal(parseTabValue("not json"), null);
+  assert.equal(parseTabValue(""), null);
 });

@@ -78,9 +78,30 @@ Focus moves to the neighbouring pane:
 - [ ] Prefix then **r** shows a short "tilefox: Reloaded" message, and `tilefox.log` has a `reload done` line
 - [ ] Set `about:config` → `tilefox.keys.splitRight` = `Ctrl+U`, then prefix r: Ctrl+U now splits right. Reset the pref afterwards
 - [ ] Ctrl+Shift+P opens the palette (note: this replaces Firefox's "New private window" key; use the menu instead)
-- [ ] Prefix then **p** also opens the palette
+- [ ] Prefix then **f** also opens the palette (prefix **p** is now previous-window, as in tmux)
 - [ ] Typing a fuzzy query (for example `gml` for Gmail) filters tabs, ↑/↓ moves and Enter jumps there. Panes are marked ▣1, ▣2…
 - [ ] Tabs from a second window are listed, and Enter switches to that window
+
+## 5b. Windows (tmux windows), ~15 min
+
+Prefix = Ctrl+A on page text, or Ctrl+Space anywhere.
+- [ ] A status line under the toolbars reads `0:<site>*`
+- [ ] Split the window (Ctrl+Y). Prefix **c**: a new window with one new tab, the URL bar is focused, the first window's tabs disappear from the tab strip, and the status line reads `0:...-  1:...*`
+- [ ] Open a page and a link in a new tab (middle-click): both tabs stay in window 1
+- [ ] **Alt+L** goes back to window 0 **instantly**: its split comes back exactly, and no page reloads (a playing video keeps playing, a half-typed form keeps its text)
+- [ ] **Alt+L** again toggles to window 1. Prefix **l** does the same
+- [ ] Prefix **n** / **p** step through windows; prefix **0** / **1** and **Alt+0** / **Alt+1** jump straight there; prefix **7** says "can't find window: 7"
+- [ ] Alt+1 on Windows doesn't also switch tab (Firefox's tab keys are Ctrl+1…9 there) and opens no menu
+- [ ] Prefix **,** opens a small input: type `dev`, Enter, and the status line shows `1:dev*`. An empty name goes back to the automatic name
+- [ ] Prefix **w** lists windows; Enter switches. Ctrl+Shift+P lists `window:dev` entries plus tabs from hidden windows marked `[1:dev]`, and Enter on one switches there
+- [ ] Clicking a status-line entry switches to that window
+- [ ] Close every tab of window 1 with Ctrl+W: window 1 disappears and you land on window 0
+- [ ] Prefix **&** asks `kill-window ...? (y/n)`; **n** cancels, **y** closes that window's tabs. With one window left it refuses
+- [ ] Ctrl+N: the new Firefox window has its own status line `0:...*`, and its windows don't touch the first Firefox window's
+- [ ] Restart Firefox (with "Open previous windows and tabs" on in Settings): the same windows, names, tabs and splits come back, on the same current window
+- [ ] Ctrl+Alt+Shift+K shows all tabs and hides the status line; again restores the windows
+- [ ] `about:config` → `tilefox.statusbar` = false hides the status line
+- [ ] `tilefox.log` has `window -> ...`, `new window` and `windows restored` lines
 
 ## 6. Vimium in both panes, ~15 min
 
@@ -117,6 +138,8 @@ In each pane (click it first):
 - [ ] Your normal profile opens fine and `about:profiles` no longer lists tilefox-spike
 
 ## How to collect logs
+
+- **tilefox.log** is in the profile folder (`%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\tilefox.log`). The Browser Console prints its path at startup (`[tilefox] file log: ...`). If it can't be written, the console shows `CANNOT WRITE LOG FILE` and the window shows a notification bar.
 
 - **Browser Console** (where all tilefox output goes): Ctrl+Shift+J in the spike profile. Filter on `tilefox`. Errors from our scripts start with `[tilefox]`. Loader errors mention `fx-autoconfig` or `boot.sys.mjs`. Right-click → "Copy all Messages" (or "Save all Messages to File") and paste into a note.
 - **Content-side errors** (TilefoxChild, which runs inside page processes): these appear in the same Browser Console. Make sure the console's "Show Content Messages" option (gear icon) is ticked.
