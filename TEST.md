@@ -1,6 +1,6 @@
 # termfox spike: test checklist (about 2 hours, Windows 11)
 
-The keys mirror your `~/.tmux.conf` (README → "What it does", spec in KEYMAP-SPEC.md). Every key decision is in `<profile>\termfox.log`.
+The keys mirror your `~/.tmux.conf` (README → "What it does", spec in KEYMAP-SPEC.md). With `termfox.debugLog` = true (about:config; off by default), every key decision is in `<profile>\termfox.log`.
 
 On an install made before the rename (2026-10-08) the profile is `tilefox-spike`, not `termfox`. Wherever this list says the termfox profile, use that one. `launch-termfox.cmd` picks it automatically.
 
@@ -28,7 +28,7 @@ If this section fails, stop: it is a Firefox/Windows problem, not termfox. After
 
 - [ ] `install.ps1` ran without errors, and the UAC prompt listed exactly `config.js` and `defaults\pref\config-prefs.js`
 - [ ] Launch with `launch-termfox.cmd`. The window opens on the **termfox** profile (`about:profiles` shows it as "This is the profile in use")
-- [ ] Browser Console (Ctrl+Shift+J) shows `[termfox] JSWindowActor registered` and `[termfox] ready in window; enabled = true`
+- [ ] Browser Console (Ctrl+Shift+J) shows `[termfox] JSWindowActor registered` and `[termfox] ready in window; paused = false`
 - [ ] Your normal Firefox profile still opens as before (`firefox.exe` without `-P`) and does not show the `[termfox]` lines
 
 Then install from AMO into the spike profile: **Vimium**, plus uBlock Origin and your password manager if you want the daily-driver feel.
@@ -132,11 +132,14 @@ In each pane (click it first):
 - [ ] While composing (the underlined candidate text is visible), Ctrl+Arrow does not move pane focus or break the composition
 - [ ] Note: if your IME uses Ctrl+Space to switch input language, Windows takes that key first, so use Ctrl+A (outside fields) as the prefix
 
-## 9. Kill switch, ~5 min
+## 9. Pause, ~5 min
 
-- [ ] Ctrl+Alt+Shift+K: a "termfox disabled" bar appears, panes dissolve into normal tabs, Ctrl+H opens **History** again, Ctrl+A selects the page and Alt+Left goes Back
+- [ ] Ctrl+Alt+Shift+K: a "termfox paused" bar appears, panes dissolve into normal tabs, Ctrl+H opens **History** again, Ctrl+A selects the page and Alt+Left goes Back
 - [ ] Ctrl+Left and Alt+Y on a page do nothing special while disabled
-- [ ] Ctrl+Alt+Shift+K again re-enables it (Ctrl+H splits)
+- [ ] Ctrl+Alt+Shift+K again resumes it (Ctrl+H splits)
+- [ ] While paused, `termfox.log` gets no new lines; after a restart termfox is still paused
+- [ ] Prefix then Shift+L shows "log cleared" and `termfox.log` is gone
+- [ ] A private window (Ctrl+Shift+N from the menu): its tabs don't appear in a normal window's palette, and nothing from it reaches `termfox.log`
 - [ ] `about:config` → `termfox.enabled` = false gives the same result as the key
 - [ ] Total off switch: `about:config` → `userChromeJS.enabled` = false, then restart. Nothing from termfox or the loader runs
 
@@ -148,7 +151,7 @@ In each pane (click it first):
 
 ## How to collect logs
 
-- **termfox.log** is in the profile folder (`%APPDATA%\Mozilla\Firefox\Profiles\termfox\termfox.log`). The Browser Console prints its path at startup (`[termfox] file log: ...`). If it can't be written, the console shows `CANNOT WRITE LOG FILE` and the window shows a notification bar.
+- **termfox.log** is off by default: set `termfox.debugLog` = true in about:config first. It is in the profile folder (`%APPDATA%\Mozilla\Firefox\Profiles\termfox\termfox.log`) and holds action names, outcomes and timings only. If it can't be written, the console shows `cannot write the log file` and the window shows a notification bar.
 
 - **Browser Console** (where all termfox output goes): Ctrl+Shift+J in the spike profile. Filter on `termfox`. Errors from our scripts start with `[termfox]`. Loader errors mention `fx-autoconfig` or `boot.sys.mjs`. Right-click → "Copy all Messages" (or "Save all Messages to File") and paste into a note.
 - **Content-side errors** (TermfoxChild, which runs inside page processes): these appear in the same Browser Console. Make sure the console's "Show Content Messages" option (gear icon) is ticked.

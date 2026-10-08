@@ -1,6 +1,6 @@
 # Keymap spec: mirror Ryan's ~/.tmux.conf (2026-10-08)
 
-Source: /home/ryano/.tmux.conf. Where a key is bound twice, the last binding wins.
+Source: `~/.tmux.conf`. Where a key is bound twice, the last binding wins.
 
 | Key | tmux | termfox behaviour |
 |---|---|---|

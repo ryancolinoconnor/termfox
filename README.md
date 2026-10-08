@@ -25,11 +25,12 @@ field, editor, URL bar, select or similar, the key goes to the page instead, jus
 | **Ctrl+Space** | (alias) | Prefix, always (also while typing). |
 | prefix then `y` / `h` / arrows | | Split right / split down / move focus |
 | prefix then `r` | `bind r source-file` | Reload: re-reads the keymap prefs and the stylesheet in every window, shows "Reloaded". |
+| prefix then `L` (Shift+L) | | Delete termfox's log files (`termfox.log`, `termfox.log.1`, old `tilefox.log`). |
 | prefix then `f` / `x` | `f` find-window | Palette / unpane (turn the focused pane back into a normal tab). Esc cancels. (`p` is now previous-window, as in tmux.) |
 | prefix then `c` `n` `p` `l` `0`–`9` `,` `w` `&` | tmux defaults | **Windows** (below): new, next, previous, last, select by index, rename, list, kill. |
 | **Alt+L** / **Alt+0…9** | | Last window / select window N, no prefix. |
 | **Ctrl+Shift+P** | | Fuzzy palette over termfox windows (`window:name`), panes (▣) and tabs in all windows. Replaces "New private window" (use the menu). |
-| **Ctrl+Alt+Shift+K** | | Kill switch: toggles `termfox.enabled`. Off means panes dissolve and Firefox's keys come back. |
+| **Ctrl+Alt+Shift+K** | | Pause / resume: toggles `termfox.enabled`. Paused: panes dissolve, Firefox's keys come back, logging and actor messages stop. Not an off switch: uninstall for that (SECURITY.md). |
 | mouse | `mouse on` | Click a pane to focus it. |
 
 - Every pane is a **real tab**, so extensions, Vimium, logins and DRM work in it as usual. Closing a pane's
@@ -53,7 +54,7 @@ click an entry to switch, or set `termfox.statusbar` = false to hide it.
   and layouts; `setCustomTabValue` "termfox-tab" for each tab's window). Reopening a closed tab puts it back in
   its old window.
 - Every Firefox window (Ctrl+N) has its own set of termfox windows and its own status line.
-- The kill switch shows every tab; turning termfox back on hides the other windows again.
+- Pausing shows every tab; resuming hides the other windows again (tabs opened or closed while paused are sorted out on resume).
 
 ### Changing keys
 
@@ -67,17 +68,20 @@ keys to follow. Bad values fall back to the default and are logged.
 
 ## Debug log
 
-Every `[termfox]` line (plus caught errors with stacks) is also appended to
-`%APPDATA%\Mozilla\Firefox\Profiles\termfox\termfox.log` (rotates to `termfox.log.1` at 1 MB).
-The Browser Console prints `[termfox] file log: <path>` at startup. If a write fails, the console shows
-`[termfox] CANNOT WRITE LOG FILE <path>` with the error, and the window shows a notification bar once.
+**Off by default.** Set `about:config` → `termfox.debugLog` = `true` to append every `[termfox]` line to
+`%APPDATA%\Mozilla\Firefox\Profiles\termfox\termfox.log` (rotates to `termfox.log.1` at 1 MB). Lines hold
+action names, outcomes and timings only: never typed keys, hosts, titles, window names or raw error text
+(errors keep their type and a stack with strings and paths redacted). Every string is cut to 300 characters and
+stripped of control characters. Private windows and paused termfox never write it. Prefix then **Shift+L**
+deletes the log files (also an old `tilefox.log`). If a write fails, the console shows
+`[termfox] cannot write the log file` and the window shows a notification bar once. See SECURITY.md.
 (Before 2026-10-08 no log was ever created: the writer used IOUtils mode `"append"`, which refuses to create a
 missing file. It now uses `"appendOrCreate"`.)
 At startup it records the Firefox version, the background-pane painting path
 (`native-splitViewBrowsers`, `switcher-patch` or `docshell-only`), the key map, each hotkey's
 registration and the actor registration. Every key press that matches the keymap is logged with its decision
-(taken, passed through and why, or deferred to the page), and content actors log their typing checks through the
-parent. Prefix keys and reloads are logged too.
+(taken, passed through and why, or deferred to the page), and content actors report fixed event codes
+(`take`, `pass-typing`, ...) through the parent. Prefix actions (not the key pressed) and reloads are logged too.
 
 Every action logs its latency, measured from the key press (the keydown's own timestamp; for keys the page
 decides, the content process's timestamp):
@@ -108,8 +112,10 @@ in `Termfox.latencies` (Browser Console, in a window's context).
 4. In the spike profile, install Vimium from AMO, then work through `TEST.md`.
 
 The two program-folder files are read by every profile of this Firefox install. `config.js` only loads
-scripts for a profile that has `chrome\utils\chrome.manifest`, and only the spike profile has one. It does set
-`general.config.sandbox_enabled=false` as a default pref for the install, which fx-autoconfig needs on Release.
+scripts for a profile that has `chrome\utils\chrome.manifest`, and only the spike profile has one, but anything
+that can write a profile could add one. It sets `general.config.sandbox_enabled=false` as a default pref for the
+install, which fx-autoconfig needs on Release. Read **SECURITY.md** (trust model, what the scripts can do, why a
+dedicated Firefox install under Program Files is the cautious choice).
 
 ## Uninstall
 
@@ -141,7 +147,7 @@ The project was called **tilefox** until 2026-10-08. Installs made before the re
   both the old and the new script names.
 - On first start, user-set `tilefox.*` prefs (`enabled`, `statusbar`, `keys.*`) are copied once to
   `termfox.*` (logged as `prefs: copied from tilefox.*`). Change the `termfox.*` ones from then on.
-  The old profile's `user.js` still sets `tilefox.enabled`, which now does nothing.
+  Installers no longer write `termfox.enabled` / `tilefox.enabled` to `user.js` (it undid a pause on every start).
 - Windows and layouts saved under the old SessionStore names (`tilefox-windows`, `tilefox-tab`) are read
   when the new ones are missing, then saved under the new names.
 - The log is now `termfox.log`. An old `tilefox.log` in the profile is left as it was.
@@ -153,7 +159,7 @@ The project was called **tilefox** until 2026-10-08. Installs made before the re
 
 ```
 install.ps1 / uninstall.ps1 / launch-termfox.cmd
-profile/chrome/JS/termfox.uc.mjs                  per-window script: layout, keys, palette, kill switch
+profile/chrome/JS/termfox.uc.mjs                  per-window script: layout, keys, palette, pause
 profile/chrome/JS/termfox_actor.sys.mjs           registers the JSWindowActor once per session
 profile/chrome/JS/termfox/TermfoxChild.sys.mjs    content process: is the focus editable? routes Ctrl+Arrow
 profile/chrome/JS/termfox/TermfoxParent.sys.mjs   forwards actor messages/log lines to the window
@@ -172,7 +178,7 @@ profile/chrome/CSS/termfox.uc.css                 pane geometry, focus frame, pa
   `gBrowser.splitViewBrowsers` so background panes keep painting, plus the `#tabbrowser-tabpanels` deck CSS.
   If `splitViewBrowsers` disappears it falls back to patching the tab switcher, then to re-activating pane
   browsers after each tab switch; `termfox.log` says which path is in use. A Firefox update can break this, and
-  the kill switch is the escape hatch. Smoke-test after each Firefox update.
+  pause (Ctrl+Alt+Shift+K) is the escape hatch. Smoke-test after each Firefox update.
 - **Firefox's own Split View** (tab context menu → Split View) and termfox panes don't mix. Termfox refuses to
   split a tab that's already in a native split.
 - **Outside text fields**, Ctrl+Y splits instead of redo, Ctrl+H splits instead of opening History (use
