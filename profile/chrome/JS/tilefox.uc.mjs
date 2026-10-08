@@ -66,6 +66,10 @@ const logger = Core.getLogger();
 const LOG = (...a) => logger.log(...a);
 const ERR = (...a) => logger.error(...a);
 
+// The TilefoxWindow of a Firefox window. Core's registry is the source of truth (the parent actor
+// and fx-autoconfig's hotkey commands run in other modules); window.Tilefox is kept for debugging.
+const tilefoxOf = w => Core.instanceForWindow(w) ?? w?.Tilefox ?? null;
+
 const ARROW_KEYS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]);
 const SCRIPT_FILES = ["tilefox.uc.mjs", "tilefox_actor.sys.mjs"];
 const STYLE_FILE = "tilefox.uc.css";
@@ -177,6 +181,7 @@ class TilefoxWindow {
       () => this.safe(() => this.restoreFromSession("promiseAllWindowsRestored")),
       e => ERR("promiseAllWindowsRestored", e));
     this.win.addEventListener("TabSwitchDone", () => this.safe(() => this.onSwitchDone()));
+    this.win.addEventListener("TabSwitched", e => this.safe(() => this.onSwitched(e.detail?.tab)));
     // Chrome-focus Ctrl+Arrow (URL bar, toolbar). Content focus is TilefoxChild's job.
     this.win.addEventListener("keydown", e => this.safe(() => this.onChromeKeydown(e)), true);
     this.win.addEventListener("unload", () => { this.unloading = true; this.dissolve(); }, { once: true });
@@ -240,7 +245,7 @@ class TilefoxWindow {
           modifiers: hk.modifiers,
           key: hk.key,
           reserved: true,
-          command: win => win.Tilefox?.onHotkey(d.action),
+          command: win => tilefoxOf(win)?.onHotkey(d.action),
         });
         // Kill switch stays live even when disabled, so it can toggle back on.
         Promise.resolve(def.attachToWindow(this.win, { suppressOriginal: d.action !== "kill" })).then(
@@ -318,8 +323,11 @@ class TilefoxWindow {
         el.setAttribute("disabled", "true");
       }
     }
+    // Most originals are already disabled by fx-autoconfig's suppressOriginal, so list what is
+    // disabled now rather than only what this call disabled (the old line was always empty).
+    const originals = on ? this.findOriginalKeys().filter(k => k.getAttribute("disabled") === "true") : [];
     LOG("keys", on ? "active" : "released", "- originals suppressed:",
-      this.suppressed.map(k => k.id || k.getAttribute("key")).join(", "));
+      originals.map(k => k.id || k.getAttribute("key")).join(", ") || "none found");
   }
 
   // ---------------------------------------------------------------- actions
@@ -493,6 +501,7 @@ class TilefoxWindow {
 
   onTabSelect() {
     const tab = this.gBrowser.selectedTab;
+    this.switchedTo = null; // a new switch starts; switchShown() waits for its own signal
     const owner = this.ws.ownerOf(tab);
     if (this.enabled && !this.switching && owner && owner !== this.ws.current && !tab.pinned) {
       // Deferred: this can run inside Firefox's tab removal (blur to the guard's successor).
@@ -899,7 +908,7 @@ class TilefoxWindow {
     return this.settle(newTab, "split");
   }
 
-  // Resolves once `tab` has its panel, the tab switch to it is done (TabSwitchDone) and the
+  // Resolves once `tab` has its panel, the tab switch to it is done (switchShown) and the
   // layout is applied again. Each wait gives up after switchWaitMs, logging which step stalled.
   async settle(tab, why) {
     const gb = this.gBrowser;
@@ -907,7 +916,7 @@ class TilefoxWindow {
       LOG(`${why}: new tab still has no panel after ${this.switchWaitMs} ms; continuing`);
     }
     if (gb.selectedTab === tab && !tab.closing && !(await this.switchDone(tab))) {
-      LOG(`${why}: no TabSwitchDone after ${this.switchWaitMs} ms; continuing`);
+      LOG(`${why}: tab switch not finished (no TabSwitched) after ${this.switchWaitMs} ms; continuing`);
     }
     this.apply();
   }
@@ -931,27 +940,43 @@ class TilefoxWindow {
     });
   }
 
-  // TabSwitchDone fires on the window when AsyncTabSwitcher has shown the selected tab.
-  switchDone(tab) {
-    if (this.switchedTo === tab) {
-      return Promise.resolve(true);
+  // Is the switch to `tab` finished? Firefox 157 AsyncTabSwitcher dispatches "TabSwitched"
+  // ({detail: {tab}}) from maybeFinishTabSwitch() once the requested tab is painted, and
+  // "TabSwitchDone" only from finish(), when every background tab has settled. With live panes
+  // finish() is late or never comes (the 18:57 log: every split/focus waited the full 1.5 s).
+  // Both are dispatched through gBrowser.dispatchEvent -> tabpanels and bubble to the window.
+  // The switcher state is also read directly, because requestTab() of the tab that is already
+  // requested starts no switch and sends no event.
+  //   browser/components/tabbrowser/AsyncTabSwitcher.sys.mjs (FIREFOX_157_0_1_RELEASE)
+  switchShown(tab) {
+    const gb = this.gBrowser;
+    if (gb.selectedTab !== tab || tab.closing) {
+      return false;
     }
-    return new Promise(resolve => {
-      const waiter = { tab, resolve };
-      (this.switchWaiters ||= []).push(waiter);
-      this.win.setTimeout(() => {
-        this.switchWaiters = this.switchWaiters.filter(w => w !== waiter);
-        resolve(false);
-      }, this.switchWaitMs);
-    });
+    if (this.switchedTo === tab) {
+      return true;
+    }
+    const sw = gb._switcher;
+    if (!sw) {
+      // No switch running: done if the browser is active (finish() destroyed the switcher).
+      return !!tab.linkedBrowser?.docShellIsActive;
+    }
+    return sw.requestedTab === tab && !sw.switchInProgress
+      && (typeof sw.getTabState !== "function" || sw.getTabState(tab) === sw.STATE_LOADED);
+  }
+
+  switchDone(tab) {
+    return this.until(() => this.switchShown(tab));
+  }
+
+  onSwitched(tab) {
+    if (tab && tab === this.gBrowser.selectedTab) {
+      this.switchedTo = tab;
+    }
   }
 
   onSwitchDone() {
-    const tab = this.gBrowser.selectedTab;
-    this.switchedTo = tab;
-    const ready = (this.switchWaiters || []).filter(w => w.tab === tab);
-    this.switchWaiters = (this.switchWaiters || []).filter(w => w.tab !== tab);
-    ready.forEach(w => w.resolve(true));
+    this.switchedTo = this.gBrowser.selectedTab;
     this.activatePaneBrowsers();
   }
 
@@ -1093,7 +1118,7 @@ class TilefoxWindow {
     // Union across all windows, because sharedData is global.
     const ids = [];
     for (const w of Services.wm.getEnumerator("navigator:browser")) {
-      for (const b of w.Tilefox?.activePaneBrowsers() || []) {
+      for (const b of tilefoxOf(w)?.activePaneBrowsers() || []) {
         if (b.browserId) {
           ids.push(b.browserId);
         }
@@ -1371,7 +1396,7 @@ class TilefoxWindow {
   allItems(windowsOnly = false) {
     const items = [];
     for (const w of Services.wm.getEnumerator("navigator:browser")) {
-      const t = w.Tilefox;
+      const t = tilefoxOf(w);
       const other = w !== this.win;
       for (const tw of t?.ws.windows || []) {
         const name = t.nameOf(tw);
@@ -1446,7 +1471,7 @@ class TilefoxWindow {
   }
 
   jumpTo(item) {
-    const t = item.win.Tilefox;
+    const t = tilefoxOf(item.win);
     item.win.focus();
     if (item.wid) {
       t?.selectWindow(item.wid);
@@ -1475,10 +1500,11 @@ class TilefoxWindow {
     }
     let windows = 0;
     for (const w of Services.wm.getEnumerator("navigator:browser")) {
-      w.Tilefox?.safe(() => {
-        w.Tilefox.loadKeyMap();
-        w.Tilefox.applyKeyState();
-        w.Tilefox.apply();
+      const t = tilefoxOf(w);
+      t?.safe(() => {
+        t.loadKeyMap();
+        t.applyKeyState();
+        t.apply();
         windows++;
       });
     }
@@ -1525,13 +1551,15 @@ class TilefoxWindow {
 // ---------------------------------------------------------------- boot
 (function boot() {
   const win = window;
-  if (win.Tilefox) {
+  if (tilefoxOf(win)) {
     return;
   }
   const start = () => {
     try {
       const t = new TilefoxWindow(win);
       win.Tilefox = t;
+      const unregister = Core.registerInstance(t);
+      win.addEventListener("unload", unregister, { once: true });
       t.init();
     } catch (e) {
       ERR("init failed", e);

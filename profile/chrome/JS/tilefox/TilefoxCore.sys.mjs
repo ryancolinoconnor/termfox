@@ -885,6 +885,57 @@ export function createFileLogger({ io, dir, joinPath, maxBytes = LOG_MAX_BYTES, 
   };
 }
 
+// ---------------------------------------------------------------- window instances
+
+/*
+ * One TilefoxWindow per Firefox window registers here. This module is a shared system module,
+ * so the window script and TilefoxParent (the parent actor) get the same registry. The actor
+ * used to read `browser.ownerGlobal.Tilefox`. On Firefox 157 that came back empty although the
+ * window script had set `window.Tilefox`, so every content-routed action and hello was dropped
+ * (log: "actor action but no Tilefox in window"). The registry doesn't depend on a window
+ * property being visible across compartments. It also matches by browser element, so it keeps
+ * working when `ownerGlobal` is not the same object the window script saw.
+ */
+const instances = new Set();
+
+/** Registers a window instance ({win, gBrowser}). Returns the unregister function. */
+export function registerInstance(inst) {
+  instances.add(inst);
+  return () => instances.delete(inst);
+}
+
+export function instanceForWindow(win) {
+  for (const i of instances) {
+    if (win && i.win === win) {
+      return i;
+    }
+  }
+  return null;
+}
+
+/** The instance whose window holds this <browser> (by ownerGlobal, else by tab lookup). */
+export function instanceForBrowser(browser) {
+  if (!browser) {
+    return null;
+  }
+  let owner = null;
+  try { owner = browser.ownerGlobal; } catch (e) {}
+  const byWin = instanceForWindow(owner);
+  if (byWin) {
+    return byWin;
+  }
+  for (const i of instances) {
+    try {
+      if (i.gBrowser?.getTabForBrowser(browser)) {
+        return i;
+      }
+    } catch (e) {}
+  }
+  return null;
+}
+
+export const instanceCount = () => instances.size;
+
 // Process-wide logger for Firefox. Content processes can't write the profile, so actors
 // forward their lines to the parent ("Tilefox:Log") instead of using this.
 let sharedLogger = null;

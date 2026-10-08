@@ -28,8 +28,10 @@ function el(tag = "div") {
 }
 
 // asyncTabs: a new tab's panel appears `tabDelay` ms after addTrustedTab, and every tab switch
-// finishes (TabSwitchDone) `switchDelay` ms after selection, like AsyncTabSwitcher.
-function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1 } = {}) {
+// finishes `switchDelay` ms after selection, like AsyncTabSwitcher. switchEvents: which events the
+// finished switch sends. Firefox 157 with live panes sends TabSwitched ({detail: {tab}}) but its
+// TabSwitchDone (switcher finish()) can stay out (live log 2026-10-08 18:57).
+function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents = ["TabSwitched", "TabSwitchDone"] } = {}) {
   const prefs = new Map();
   const tcListeners = {};
   const winListeners = {};
@@ -46,7 +48,11 @@ function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1 } = {}) {
       if (this._sel) { this._sel.selected = false; }
       this._sel = t; t.selected = true;
       emit(tcListeners, "TabSelect", t);
-      setTimeout(() => { if (this._sel === t) { emit(winListeners, "TabSwitchDone", win); } }, switchDelay);
+      setTimeout(() => {
+        if (this._sel === t) {
+          for (const type of switchEvents) { emit(winListeners, type, win, type === "TabSwitched" ? { tab: t } : undefined); }
+        }
+      }, switchDelay);
     },
     get selectedBrowser() { return this._sel?.linkedBrowser; },
     get visibleTabs() { return this.tabs.filter(t => !t.hidden && !t.closing); },
@@ -367,4 +373,106 @@ test("a stuck action can't wedge the queue", silence(async () => {
   const after = f.T.runAction("new-window", "test");
   await after;
   assert.equal(f.T.ws.windows.length, 2);
+}));
+
+// ---- parent actor -> window instance (live bug 2026-10-08: "actor action but no Tilefox in window")
+
+// Shaped like Firefox 157: TilefoxParent gets the <browser> from browsingContext.top.embedderElement,
+// and browser.ownerGlobal is not an object on which the window script's `window.Tilefox` shows up.
+globalThis.JSWindowActorParent ??= class {};
+const { TilefoxParent } = await import("../profile/chrome/JS/tilefox/TilefoxParent.sys.mjs");
+function actorFor(browser) {
+  const a = new TilefoxParent();
+  a.browsingContext = { browserId: browser.browserId, top: { embedderElement: browser } };
+  a.browsingContext.top.top = a.browsingContext.top;
+  return a;
+}
+const send = (actor, name, data) => actor.receiveMessage({ name, data });
+async function captureWarnings(fn) {
+  const warns = [];
+  const w = console.warn;
+  console.warn = (...a) => warns.push(a.join(" "));
+  try { await fn(); } finally { console.warn = w; }
+  return warns;
+}
+
+test("parent actor finds the window when ownerGlobal.Tilefox is not visible (157): hello + Ctrl+A prefix from a page", silence(async () => {
+  const f = await boot();
+  const T = f.T;
+  const page = browserEl(f.gb.tabs[0]);
+  page.ownerGlobal = { document: f.win.document }; // a different object: no Tilefox property on it
+  assert.equal(page.ownerGlobal.Tilefox, undefined, "the old lookup (ownerGlobal.Tilefox) fails here");
+  const actor = actorFor(page);
+  const warns = await captureWarnings(async () => {
+    send(actor, "Tilefox:Hello", { where: "https://example.com" });
+    assert.ok(T.actorBrowsers.has(page), "hello registers, so the window lets content decide typing");
+    // Ctrl+A on <body>: the window defers to the actor, the actor says prefix.
+    T.onChromeKeydown(keyEvent("a", { ctrlKey: true }, page));
+    send(actor, "Tilefox:Action", { action: "prefix", via: "content" });
+    await settled(T);
+  });
+  assert.equal(T.panel.state, "open", "prefix panel opened from a content-routed Ctrl+A");
+  assert.ok(!warns.some(w => w.includes("no Tilefox in window")), warns.join("\n"));
+}));
+
+test("parent actor resolves via ownerGlobal when it is the window, and each window gets its own actions", silence(async () => {
+  const a = await boot();
+  const b = await boot();
+  const pa = browserEl(a.gb.tabs[0]);
+  pa.ownerGlobal = a.win;
+  const pb = browserEl(b.gb.tabs[0]);
+  pb.ownerGlobal = { other: true };
+  send(actorFor(pa), "Tilefox:Hello", {});
+  send(actorFor(pb), "Tilefox:Hello", {});
+  assert.ok(a.T.actorBrowsers.has(pa) && !a.T.actorBrowsers.has(pb));
+  assert.ok(b.T.actorBrowsers.has(pb) && !b.T.actorBrowsers.has(pa));
+  send(actorFor(pb), "Tilefox:Action", { action: "split-col", via: "content" });
+  await settled(b.T);
+  await settled(a.T);
+  assert.equal(b.T.paneTabs().length, 2);
+  assert.equal(a.T.paneTabs().length, 0);
+}));
+
+test("parent actor still warns for a browser no tilefox window owns", silence(async () => {
+  await boot();
+  const stray = { browserId: 999, ownerGlobal: {}, localName: "browser" };
+  const warns = await captureWarnings(() => send(actorFor(stray), "Tilefox:Action", { action: "prefix", via: "content" }));
+  assert.ok(warns.some(w => w.includes("actor action but no Tilefox in window")), warns.join("\n"));
+}));
+
+// ---- tab switch wait (live: "split: no TabSwitchDone after 1500 ms" on every split/focus)
+
+test("split settles on TabSwitched when TabSwitchDone never comes (157 with live panes)", silence(async () => {
+  const f = await boot({ switchDelay: 20, switchEvents: ["TabSwitched"] });
+  const t0 = Date.now();
+  await f.T.runAction("split-col", "test");
+  await f.T.runAction("split-row", "test");
+  await f.T.runAction("focus-up", "test");
+  await f.T.idle();
+  assert.equal(f.T.paneTabs().length, 3);
+  assert.ok(Date.now() - t0 < 1000, `no 1.5 s fallback waits (took ${Date.now() - t0} ms)`);
+}));
+
+test("split settles from the switcher state when no event comes at all", silence(async () => {
+  const f = await boot({ switchDelay: 5, switchEvents: [] });
+  // AsyncTabSwitcher after maybeFinishTabSwitch(): requested tab loaded, switch no longer in progress.
+  Object.defineProperty(f.gb, "_switcher", { get() {
+    return { requestedTab: f.gb.selectedTab, switchInProgress: false, STATE_LOADED: 1, getTabState: () => 1 };
+  } });
+  const t0 = Date.now();
+  await f.T.runAction("split-col", "test");
+  await f.T.idle();
+  assert.equal(f.T.paneTabs().length, 2);
+  assert.ok(Date.now() - t0 < 1000, `took ${Date.now() - t0} ms`);
+}));
+
+test("split still waits while the switcher is mid-switch, then gives up after switchWaitMs", silence(async () => {
+  const f = await boot({ switchDelay: 5, switchEvents: [] });
+  f.gb._switcher = { requestedTab: null, switchInProgress: true, STATE_LOADED: 1, getTabState: () => 0 };
+  f.T.switchWaitMs = 60;
+  const t0 = Date.now();
+  await f.T.runAction("split-col", "test");
+  await f.T.idle();
+  assert.ok(Date.now() - t0 >= 55, "waited for the fallback timeout");
+  assert.equal(f.T.paneTabs().length, 2);
 }));
