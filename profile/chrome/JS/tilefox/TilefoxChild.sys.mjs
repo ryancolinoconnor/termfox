@@ -7,15 +7,20 @@
  *   - Ctrl+Arrow in an editable element  -> do nothing (native word-jump runs)
  *   - Ctrl+Arrow elsewhere, and this tab is a tilefox pane -> eat the key, ask the parent
  *     to move pane focus
- *   - Ctrl+H / Ctrl+Y -> fallback only. The chrome <key> elements are declared
- *     reserved="true", so normally content never sees these keys. If it does, we route them.
+ *   - split keys (tilefox.keys.splitRight / splitDown) -> fallback only. The chrome window's
+ *     capture keydown listener normally handles them before content sees them.
+ * On every top-level pageshow it says hello, so the parent knows this browser has a working
+ * actor (otherwise the window handles Ctrl+Arrow itself). Decisions are sent to the parent
+ * as "Tilefox:Log" because the content sandbox can't write the profile's tilefox.log.
  *
  * JSWindowActor docs: https://firefox-source-docs.mozilla.org/dom/ipc/jsactors.html
- * Actor options (allFrames, events, messageManagerGroups):
- *   https://searchfox.org/mozilla-central/source/dom/chrome-webidl/JSWindowActor.webidl
  * Services.cpmm.sharedData (SharedMap, parent -> child state):
  *   https://searchfox.org/mozilla-central/source/dom/ipc/SharedMap.h
  */
+
+import { isEditable, resolveKeyMap, splitActionFor } from "./TilefoxCore.sys.mjs";
+
+export { isEditable };
 
 const ARROWS = {
   ArrowLeft: "focus-left",
@@ -23,11 +28,6 @@ const ARROWS = {
   ArrowUp: "focus-up",
   ArrowDown: "focus-down",
 };
-
-const TEXT_INPUT_TYPES = new Set([
-  "text", "search", "url", "tel", "email", "password", "number",
-  "date", "datetime-local", "month", "time", "week", "",
-]);
 
 function deepActiveElement(doc) {
   let el = doc.activeElement;
@@ -38,60 +38,52 @@ function deepActiveElement(doc) {
   return el;
 }
 
-export function isEditable(el, doc) {
-  if (doc && doc.designMode === "on") {
-    return true;
-  }
-  if (!el) {
-    return false;
-  }
-  const tag = el.localName;
-  if (tag === "textarea") {
-    return !el.readOnly && !el.disabled;
-  }
-  if (tag === "input") {
-    const type = (el.getAttribute("type") || "").toLowerCase();
-    return TEXT_INPUT_TYPES.has(type) && !el.readOnly && !el.disabled;
-  }
-  if (tag === "select") {
-    return true; // arrows mean something there too
-  }
-  if (el.isContentEditable) {
-    return true;
-  }
-  // ARIA widgets that take arrow keys (custom editors, comboboxes, sliders...).
-  const role = el.getAttribute?.("role");
-  if (role && /^(textbox|combobox|searchbox|spinbutton|slider|grid|tree|listbox|menu|menubar|tablist)$/.test(role)) {
-    return true;
-  }
-  return false;
-}
-
 export class TilefoxChild extends JSWindowActorChild {
+  log(msg) {
+    try {
+      this.sendAsyncMessage("Tilefox:Log", { msg });
+    } catch (e) {}
+  }
+
   handleEvent(event) {
+    try {
+      this.onEvent(event);
+    } catch (e) {
+      this.log(`child error: ${e}\n${e?.stack || ""}`);
+    }
+  }
+
+  onEvent(event) {
+    if (event.type === "pageshow") {
+      if (this.browsingContext === this.browsingContext?.top) {
+        let where = "";
+        try { where = this.document.location.protocol + "//" + this.document.location.host; } catch (e) {}
+        this.sendAsyncMessage("Tilefox:Hello", { where });
+      }
+      return;
+    }
     if (event.type !== "keydown" || event.defaultPrevented || event.isComposing) {
+      return;
+    }
+    if (!event.ctrlKey) {
       return;
     }
     if (!Services.prefs.getBoolPref("tilefox.enabled", true)) {
       return;
     }
-    if (!event.ctrlKey || event.altKey || event.metaKey) {
-      return;
-    }
 
-    // Ctrl+H / Ctrl+Y fallback (see header). Shift excluded so Ctrl+Shift+Y etc. are untouched.
-    if (!event.shiftKey && (event.code === "KeyH" || event.code === "KeyY")) {
+    const keyMap = resolveKeyMap(name => Services.prefs.getStringPref(name, ""));
+    const split = splitActionFor(keyMap, event);
+    if (split) {
       event.preventDefault();
       event.stopImmediatePropagation();
-      this.sendAsyncMessage("Tilefox:Action", {
-        action: event.code === "KeyH" ? "split-row" : "split-col",
-        via: "content-fallback",
-      });
+      this.log(`content: ${event.code} reached content (chrome listener missed it) -> ${split}`);
+      this.sendAsyncMessage("Tilefox:Action", { action: split, via: "content-fallback" });
       return;
     }
 
     const action = ARROWS[event.key];
-    if (!action || event.shiftKey) {
+    if (!action || event.shiftKey || event.altKey || event.metaKey) {
       return; // Ctrl+Shift+Arrow = select word: always native
     }
 
@@ -99,16 +91,20 @@ export class TilefoxChild extends JSWindowActorChild {
     const panes = Services.cpmm.sharedData.get("tilefox:paneBrowserIds");
     const browserId = this.browsingContext?.browserId;
     if (!panes || !browserId || !panes.includes(browserId)) {
+      this.log(`content: ${event.key} ignored, browser ${browserId} is not a pane (panes: ${JSON.stringify(panes || [])})`);
       return;
     }
 
     const doc = this.document;
-    if (isEditable(deepActiveElement(doc), doc)) {
-      return; // native word-jump
+    const el = deepActiveElement(doc);
+    if (isEditable(el, doc)) {
+      this.log(`content: ${event.key} in editable <${el?.localName}> -> native word-jump`);
+      return;
     }
 
     event.preventDefault();
     event.stopImmediatePropagation();
+    this.log(`content: ${event.key} on <${el?.localName || "none"}> -> ${action}`);
     this.sendAsyncMessage("Tilefox:Action", { action, via: "content" });
   }
 

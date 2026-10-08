@@ -34,16 +34,16 @@ Then install from AMO into the spike profile: **Vimium**, plus uBlock Origin and
 - [ ] Widevine is listed in `about:addons` → Plugins
 - [ ] Netflix plays (single tab, no panes)
 - [ ] Spotify web plays (single tab)
-- [ ] Netflix plays **inside a pane**: Ctrl+H, open Netflix in the new pane, play; the other pane keeps rendering
+- [ ] Netflix plays **inside a pane**: Ctrl+Y, open Netflix in the new pane, play; the other pane keeps rendering
 - [ ] Fullscreen (F or double-click) on Netflix in a pane fills the screen; Esc returns to the panes
 
 ## 3. Split keys, ~10 min
 
-- [ ] Ctrl+H on a normal page: a new pane opens on the **right** and the History sidebar does **not** open
-- [ ] Ctrl+Y: the current pane splits **downward** (new pane below)
+- [ ] Ctrl+Y on a normal page: a new pane opens on the **right** (side by side)
+- [ ] Ctrl+H: the current pane splits **downward** (new pane below) and the History sidebar does **not** open
 - [ ] Ctrl+H while typing in a textarea or Gmail compose box still splits (by design) and types no letter
 - [ ] Ctrl+H while the URL bar is focused splits and does not open History
-- [ ] Three or more panes: Ctrl+H, then Ctrl+Y, then Ctrl+H. Every pane renders and none goes blank
+- [ ] Three or more panes: Ctrl+Y, then Ctrl+H, then Ctrl+Y. Every pane renders and none goes blank
 - [ ] The focused pane has a blue frame, and clicking another pane moves the frame
 - [ ] Ctrl+Space then **x** "unpanes" the focused tab: it stays open as a normal tab and the remaining panes reflow
 - [ ] Closing a pane's tab (Ctrl+W) reflows the remaining panes, and with one left the layout disappears
@@ -66,7 +66,7 @@ Focus moves to the neighbouring pane:
 
 ## 5. Prefix fallback and palette, ~10 min
 
-- [ ] Ctrl+Space shows the hint bar, and **h**, **y** and the arrows then work like Ctrl+H/Y/arrows. Esc cancels, and it closes by itself after ~2.5 s
+- [ ] Ctrl+Space shows the hint bar, and **y** (right), **h** (down) and the arrows then work like Ctrl+Y/H/arrows. Esc cancels, and it closes by itself after ~2.5 s
 - [ ] Ctrl+Shift+P opens the palette (note: this replaces Firefox's "New private window" key; use the menu instead)
 - [ ] Ctrl+Space then **p** also opens the palette
 - [ ] Typing a fuzzy query (for example `gml` for Gmail) filters tabs, ↑/↓ moves and Enter jumps there. Panes are marked ▣1, ▣2…

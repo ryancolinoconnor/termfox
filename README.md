@@ -11,10 +11,10 @@ This spike answers one question: **do the keys, panes, typing and DRM all surviv
 
 | Key | Action |
 |---|---|
-| **Ctrl+H** | Split the focused pane: a new pane opens to the **right** (tmux `split-window -h`). Replaces "History sidebar". |
-| **Ctrl+Y** | Split the focused pane: a new pane opens **below**. Replaces Ctrl+Y redo (use **Ctrl+Shift+Z**). |
+| **Ctrl+Y** | Split the focused pane: a new pane opens to the **right** (side by side). Replaces Ctrl+Y redo (use **Ctrl+Shift+Z**). Pref `tilefox.keys.splitRight`. |
+| **Ctrl+H** | Split the focused pane: a new pane opens **below**. Replaces "History sidebar". Pref `tilefox.keys.splitDown`. |
 | **Ctrl+←/→/↑/↓** | Move focus to the neighbouring pane, **only** when the focus is not in a text field, editor, URL bar, select or similar. Otherwise the normal word-jump happens. |
-| **Ctrl+Space**, then `h` `y` arrows `p` `x` | Prefix mode: the same actions without the Ctrl combos (`x` = unpane, `p` = palette). Esc cancels. |
+| **Ctrl+Space**, then `y` (right) `h` (down) arrows `p` `x` | Prefix mode: the same actions without the Ctrl combos (`x` = unpane, `p` = palette). Esc cancels. |
 | **Ctrl+Shift+P** | Fuzzy palette over panes (▣) and tabs in all windows. Replaces "New private window" (use the menu). |
 | **Ctrl+Alt+Shift+K** | Kill switch: toggles `tilefox.enabled`. Off means panes dissolve and Firefox's keys come back. |
 
@@ -22,6 +22,19 @@ This spike answers one question: **do the keys, panes, typing and DRM all surviv
   tab, or "unpaning" it (Ctrl+Space then x), turns it back into a normal tab.
 - The focused pane (the selected tab) has a blue frame. Clicking a pane focuses it.
 - Selecting a tab that isn't in the layout hides the layout, and selecting one of its tabs brings it back.
+
+To swap or change the split keys, set the string prefs in `about:config`, for example
+`tilefox.keys.splitRight` = `Ctrl+H` and `tilefox.keys.splitDown` = `Ctrl+Y`. The keydown listener picks
+them up at once; restart for the menu-style `<key>` fallback to follow.
+
+## Debug log
+
+Every `[tilefox]` line (plus caught errors with stacks) is also appended to
+`%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\tilefox.log` (rotates to `tilefox.log.1` at 1 MB).
+At startup it records the Firefox version, the background-pane painting path
+(`native-splitViewBrowsers`, `switcher-patch` or `docshell-only`), the key map, each hotkey's
+registration and the actor registration. Every Ctrl key it handles is logged with its decision, and content
+actors log their Ctrl+Arrow decisions through the parent.
 
 ## Install (Windows)
 
@@ -60,7 +73,8 @@ installed. Before editing `profiles.ini` it backs the file up to `%TEMP%`.
 
 Close Firefox, copy the changed files from `profile\chrome\` into
 `%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\chrome\`, start Firefox, then run `about:support` →
-**Clear startup cache…**. A full `uninstall.ps1` and `install.ps1` also works.
+**Clear startup cache…** (or, with Firefox closed, delete
+`%LOCALAPPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\startupCache`). Run `node --test tests/*.test.mjs` before copying. A full `uninstall.ps1` and `install.ps1` also works.
 
 ## Files
 
@@ -69,7 +83,9 @@ install.ps1 / uninstall.ps1 / launch-tilefox.cmd
 profile/chrome/JS/tilefox.uc.mjs                  per-window script: layout, keys, palette, kill switch
 profile/chrome/JS/tilefox_actor.sys.mjs           registers the JSWindowActor once per session
 profile/chrome/JS/tilefox/TilefoxChild.sys.mjs    content process: is the focus editable? routes Ctrl+Arrow
-profile/chrome/JS/tilefox/TilefoxParent.sys.mjs   forwards actor messages to the window
+profile/chrome/JS/tilefox/TilefoxParent.sys.mjs   forwards actor messages/log lines to the window
+profile/chrome/JS/tilefox/TilefoxCore.sys.mjs     pure helpers: key map, geometry, paint hook, file log
+tests/core.test.mjs                               node --test tests/*.test.mjs
 profile/chrome/CSS/tilefox.uc.css                 pane geometry, focus frame, palette
 ```
 
@@ -78,8 +94,10 @@ profile/chrome/CSS/tilefox.uc.css                 pane geometry, focus frame, pa
 - **Not persisted.** Layouts are lost on restart. There's one layout per window, and splitting a tab outside it
   starts a new layout.
 - **No resizing.** Every split is 50/50 and there are no splitters yet.
-- **Firefox-internal APIs.** Panes rely on Firefox 158 internals: shadowing `gBrowser.splitViewBrowsers` so
-  background panes keep painting, plus the `#tabbrowser-tabpanels` deck CSS. A Firefox update can break this, and
+- **Firefox-internal APIs.** Panes rely on Firefox internals (present in 157.0.1 and 158): shadowing
+  `gBrowser.splitViewBrowsers` so background panes keep painting, plus the `#tabbrowser-tabpanels` deck CSS.
+  If `splitViewBrowsers` disappears it falls back to patching the tab switcher, then to re-activating pane
+  browsers after each tab switch; `tilefox.log` says which path is in use. A Firefox update can break this, and
   the kill switch is the escape hatch. Smoke-test after each Firefox update.
 - **Firefox's own Split View** (tab context menu → Split View) and tilefox panes don't mix. Tilefox refuses to
   split a tab that's already in a native split.
