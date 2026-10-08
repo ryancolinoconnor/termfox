@@ -1,13 +1,21 @@
 <#
 .SYNOPSIS
-  Removes exactly what termfox install.ps1 added, using its manifest
+  Removes what termfox install.ps1 added, using its manifest
   (%LOCALAPPDATA%\termfox\install-manifest.json, or %LOCALAPPDATA%\tilefox\install-manifest.json for an
   install made before the rename to termfox, whose profile is "tilefox-spike"):
     - <Firefox>\config.js and <Firefox>\defaults\pref\config-prefs.js (admin; only files the
-      installer created, and only if they are still byte-identical to what it wrote)
+      installer created, and only if they are byte-identical to the fx-autoconfig files termfox installs)
     - the "termfox" (or old "tilefox-spike") profile: its [ProfileN] entry in profiles.ini and its folders
-    - the manifest folder
+    - the manifest folder (kept, listing what is left, if anything could not be removed)
   Other profiles are never touched. Close ALL Firefox windows first.
+
+  This is termfox's real off switch: pausing (Ctrl+Alt+Shift+K) leaves the privileged scripts loaded.
+
+  Safety (security audit H2, 2026-10-08): the manifest lives in a folder any program running as you
+  can edit, so it is treated as untrusted. Its schema is checked; the profile folders must be exactly
+  <AppData>\Mozilla\Firefox\Profiles\<name> (and the Local twin) with no junctions; the elevated step
+  reads no manifest at all: it finds the Firefox folder itself and only ever deletes the two fixed
+  files above, only when their SHA-256 matches the hashes hard-coded in this script.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
@@ -17,18 +25,126 @@
 param(
     [switch]$KeepProfile,
     [switch]$Yes,
-    # Internal: used by the elevated child process.
+    # Internal: used by the elevated child process. Checked, never trusted.
     [switch]$ElevatedProgramRemove,
-    [string]$ManifestFile = "",
+    [string]$FirefoxDirHint = "",
+    [switch]$RemoveConfigJs,
+    [switch]$RemoveConfigPrefs,
     [string]$ResultFile = ""
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
+# ---------------------------------------------------------------- shared safety helpers
+# (same block in install.ps1 and uninstall.ps1; each script must run on its own)
+#
+# The two program-folder files termfox ever writes, and the only bytes it accepts for them
+# (fx-autoconfig dfdab5684faffc112b76ccb1d8cab7f75da0102c). The elevated steps use these
+# constants and never take a path or a hash from the manifest or the command line.
+$ProgramTargets = @(
+    @{ Key = "configJs";    Rel = "config.js";                     Src = "program/config.js";                     Sha = "80dc421264a3ea04275e1724b7b57234f89254e9582a6c17e9a911b65c3aa6d7" },
+    @{ Key = "configPrefs"; Rel = "defaults\pref\config-prefs.js"; Src = "program/defaults/pref/config-prefs.js"; Sha = "6bfd2ed139d18ff5178e0fc62a3b4058540ddbeba3adc912c0d69edb70c17ece" }
+)
+
+function Get-Sha256([string]$path) { return (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() }
+function Get-BytesSha256([byte[]]$bytes) {
+    $h = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($h.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $h.Dispose() }
+}
+function Get-FullPath([string]$p) { return [IO.Path]::GetFullPath($p).TrimEnd('\') }
+# Is $path strictly inside $root (after canonicalizing both)?
+function Test-Under([string]$root, [string]$path) {
+    return (Get-FullPath $path).StartsWith((Get-FullPath $root) + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+function Test-ReparsePoint([string]$path) {
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    return [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+}
+# $path and every existing folder between it and $root (inclusive) must be plain: no junction or symlink.
+function Assert-NoReparse([string]$root, [string]$path) {
+    $rootFull = Get-FullPath $root
+    $p = Get-FullPath $path
+    if (($p -ine $rootFull) -and -not (Test-Under $rootFull $p)) { throw "path escapes ${rootFull}: $p" }
+    while ($true) {
+        if ((Test-Path -LiteralPath $p) -and (Test-ReparsePoint $p)) { throw "refusing junction/symlink: $p" }
+        if ($p -ieq $rootFull) { break }
+        $p = Get-FullPath (Split-Path -Parent $p)
+    }
+}
+# Admin-only folders a Firefox install may live in.
+function Get-ProtectedRoots {
+    $roots = @()
+    foreach ($v in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) { if ($v) { $roots += (Get-FullPath $v) } }
+    return @($roots | Select-Object -Unique)
+}
+# HKLM only: HKCU can be changed by any program running as you.
+function Get-RegisteredFirefoxDirs {
+    $out = @()
+    foreach ($root in @("HKLM:\SOFTWARE\Mozilla\Mozilla Firefox", "HKLM:\SOFTWARE\WOW6432Node\Mozilla\Mozilla Firefox")) {
+        try {
+            $cur = (Get-ItemProperty -LiteralPath $root -ErrorAction Stop).CurrentVersion
+            if ($cur) {
+                $main = Get-ItemProperty -LiteralPath "$root\$cur\Main" -ErrorAction Stop
+                if ($main.'Install Directory') { $out += $main.'Install Directory' }
+            }
+        } catch { }
+    }
+    try {
+        $ap = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe" -ErrorAction Stop).'(default)'
+        if ($ap) { $out += (Split-Path -Parent $ap.Trim('"')) }
+    } catch { }
+    if ($env:ProgramFiles) { $out += (Join-Path $env:ProgramFiles "Mozilla Firefox") }
+    return $out
+}
+# A Firefox folder the elevated step may touch: under Program Files (admin-only), no junction or
+# symlink on the way down, firefox.exe present.
+function Test-TrustedFirefoxDir([string]$dir) {
+    if (-not $dir) { return $false }
+    try {
+        $full = Get-FullPath $dir
+        $root = Get-ProtectedRoots | Where-Object { Test-Under $_ $full } | Select-Object -First 1
+        if (-not $root) { return $false }
+        if (-not (Test-Path -LiteralPath (Join-Path $full "firefox.exe") -PathType Leaf)) { return $false }
+        Assert-NoReparse $root $full
+        return $true
+    } catch { return $false }
+}
+# The elevated step's own answer to "which Firefox": the hint only if it passes the checks above
+# (an invalid hint is an error, never silently replaced), else the registered install.
+function Resolve-TrustedFirefoxDir([string]$hint) {
+    if ($hint) {
+        if (Test-TrustedFirefoxDir $hint) { return (Get-FullPath $hint) }
+        throw "not a trusted Firefox folder (must be under Program Files, contain firefox.exe, no junctions): $hint"
+    }
+    foreach ($c in Get-RegisteredFirefoxDirs) { if (Test-TrustedFirefoxDir $c) { return (Get-FullPath $c) } }
+    throw "no Firefox install found under Program Files"
+}
+# One of the two fixed destinations, checked: inside the Firefox folder, no junction on the way.
+function Get-ProgramTargetPath([string]$ffDir, $t) {
+    $dst = Get-FullPath (Join-Path $ffDir $t.Rel)
+    if (-not (Test-Under $ffDir $dst)) { throw "path escape: $dst" }
+    Assert-NoReparse $ffDir $dst
+    return $dst
+}
+# Write exactly these bytes to a NEW file (fails if anything already exists there).
+function Write-NewFile([string]$path, [byte[]]$bytes) {
+    $fs = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }
+}
+# The elevated step only writes its result to a fresh %TEMP%\termfox-result-<32 hex>.json.
+function Assert-ResultFile([string]$path) {
+    $full = Get-FullPath $path
+    if ((Split-Path -Leaf $full) -notmatch '^termfox-result-[0-9a-f]{32}\.json$') { throw "unexpected result file name" }
+    $dir = Split-Path -Parent $full
+    if (-not (Test-Path -LiteralPath $dir -PathType Container) -or (Test-ReparsePoint $dir)) { throw "bad result folder" }
+    if (Test-Path -LiteralPath $full) { throw "result file already exists" }
+    return $full
+}
+function New-ResultFilePath { return (Join-Path $env:TEMP ("termfox-result-" + [guid]::NewGuid().ToString("N") + ".json")) }
+
 $ManifestDir  = Join-Path $env:LOCALAPPDATA "termfox"
 $ManifestPath = Join-Path $ManifestDir "install-manifest.json"
-# Not in the elevated child: it gets the manifest path as -ManifestFile.
 if (-not $ElevatedProgramRemove -and -not (Test-Path -LiteralPath $ManifestPath)) {
     # Install made before the rename (2026-10-08): same manifest format, old folder.
     $legacyDir = Join-Path $env:LOCALAPPDATA "tilefox"
@@ -45,49 +161,108 @@ $OurChromeFiles = @(
     "JS\tilefox.uc.mjs", "JS\tilefox_actor.sys.mjs", "CSS\tilefox.uc.css",
     "JS\tilefox\TilefoxChild.sys.mjs", "JS\tilefox\TilefoxParent.sys.mjs", "JS\tilefox\TilefoxCore.sys.mjs"
 )
+# Lines an installer wrote to user.js (current and older versions). -KeepProfile removes only these.
+$OurUserJsLines = @(
+    '// termfox spike profile prefs (this profile only)',
+    '// tilefox spike profile prefs (this profile only)',
+    'user_pref("termfox.enabled", true);',
+    'user_pref("tilefox.enabled", true);',
+    '// Lets the Browser Console (Ctrl+Shift+J) evaluate chrome JS while debugging the spike.',
+    'user_pref("devtools.chrome.enabled", true);'
+)
 
 function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Removed([string]$path) { Write-Host "    removed  $path" -ForegroundColor Green }
 function Fail([string]$msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
-function Get-Sha256([string]$path) { return (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() }
 
 # ================================================================ elevated child
+# Runs as admin. Reads no manifest. Deletes at most the two fixed program files, and only when
+# their bytes are the fx-autoconfig files termfox installs (hard-coded hashes).
 if ($ElevatedProgramRemove) {
-    $log = @()
+    try { $ResultFile = Assert-ResultFile $ResultFile } catch { Write-Host "ERROR: $_" -ForegroundColor Red; Start-Sleep -Seconds 5; exit 1 }
+    $log = @(); $kept = @(); $removed = @()
     try {
-        $m = Get-Content -LiteralPath $ManifestFile -Raw | ConvertFrom-Json
-        foreach ($f in $m.programFiles) {
-            if (-not $f.Created) { $log += "kept (existed before install): $($f.Path)"; continue }
-            if (-not (Test-Path -LiteralPath $f.Path)) { $log += "already gone: $($f.Path)"; continue }
-            if ((Get-Sha256 $f.Path) -ne $f.Sha) { $log += "KEPT (modified since install, check by hand): $($f.Path)"; continue }
-            Remove-Item -LiteralPath $f.Path -Force
-            $log += "removed: $($f.Path)"
-            $hasCreatedDir = $f.PSObject.Properties.Name -contains "CreatedDir"
-            if ($hasCreatedDir -and $f.CreatedDir) {
-                $d = Split-Path -Parent $f.Path
-                if ((Test-Path -LiteralPath $d) -and -not (Get-ChildItem -LiteralPath $d -Force)) {
-                    Remove-Item -LiteralPath $d -Force; $log += "removed empty dir: $d"
-                }
+        $ff = Resolve-TrustedFirefoxDir $FirefoxDirHint
+        foreach ($t in $ProgramTargets) {
+            $want = if ($t.Key -eq "configJs") { $RemoveConfigJs } else { $RemoveConfigPrefs }
+            if (-not $want) { continue }
+            $dst = Get-ProgramTargetPath $ff $t
+            if (-not (Test-Path -LiteralPath $dst)) { $log += "already gone: $dst"; $removed += $t.Key; continue }
+            if (-not (Test-Path -LiteralPath $dst -PathType Leaf) -or (Get-Sha256 $dst) -ne $t.Sha) {
+                $log += "KEPT (not the file termfox installed; check by hand): $dst"; $kept += $t.Key; continue
             }
+            Remove-Item -LiteralPath $dst -Force
+            $log += "removed: $dst"; $removed += $t.Key
         }
-        @{ ok = $true; log = $log } | ConvertTo-Json | Set-Content -LiteralPath $ResultFile -Encoding UTF8
+        Write-NewFile $ResultFile ([Text.Encoding]::UTF8.GetBytes((@{ ok = $true; log = $log; kept = $kept; removed = $removed; firefoxDir = $ff } | ConvertTo-Json -Depth 4)))
         exit 0
     } catch {
-        @{ ok = $false; error = "$_"; log = $log } | ConvertTo-Json | Set-Content -LiteralPath $ResultFile -Encoding UTF8
+        Write-NewFile $ResultFile ([Text.Encoding]::UTF8.GetBytes((@{ ok = $false; error = "$_"; log = $log; kept = $kept; removed = $removed } | ConvertTo-Json -Depth 4)))
+        Write-Host "ERROR: $_" -ForegroundColor Red
+        Start-Sleep -Seconds 5
         exit 1
     }
 }
 
-# ================================================================ main
+# ================================================================ manifest (untrusted input)
+function Assert-Manifest($m) {
+    $names = @($m.PSObject.Properties.Name)
+    foreach ($req in @("tool", "programFiles", "profileName", "profileDir", "profileCreated")) {
+        if ($names -notcontains $req) { throw "manifest has no '$req'" }
+    }
+    if (@("termfox", "tilefox-spike", "tilefox") -notcontains $m.tool) { throw "manifest is not a termfox manifest" }
+    if ($m.profileName -isnot [string] -or $m.profileName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { throw "bad profileName" }
+    if ($m.profileDir -isnot [string]) { throw "bad profileDir" }
+    if ($m.profileCreated -isnot [bool]) { throw "bad profileCreated" }
+    if ($names -contains "profileLocalDir" -and $null -ne $m.profileLocalDir -and $m.profileLocalDir -isnot [string]) { throw "bad profileLocalDir" }
+    if ($names -contains "firefoxDir" -and $null -ne $m.firefoxDir -and $m.firefoxDir -isnot [string]) { throw "bad firefoxDir" }
+    foreach ($f in @($m.programFiles)) {
+        if ($null -eq $f) { continue }
+        $fn = @($f.PSObject.Properties.Name)
+        if ($fn -notcontains "Path" -or $f.Path -isnot [string] -or $fn -notcontains "Created" -or $f.Created -isnot [bool]) { throw "bad programFiles entry" }
+        if (-not ($f.Path -like "*\config.js" -or $f.Path -like "*\defaults\pref\config-prefs.js")) { throw "unexpected program file in manifest: $($f.Path)" }
+    }
+    if ($names -contains "profileFiles") { foreach ($p in @($m.profileFiles)) { if ($null -ne $p -and $p -isnot [string]) { throw "bad profileFiles entry" } } }
+}
+
 if (-not (Test-Path -LiteralPath $ManifestPath)) { Fail "No install manifest at $ManifestPath; nothing to uninstall." }
 if (Get-Process -Name firefox -ErrorAction SilentlyContinue) { Fail "Firefox is running. Close ALL Firefox windows and run again." }
-$m = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+try {
+    $m = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    Assert-Manifest $m
+} catch { Fail "The manifest at $ManifestPath is not valid ($_). Nothing was changed; remove termfox by hand (see SECURITY.md)." }
 $hasProp = { param($o, $n) $o.PSObject.Properties.Name -contains $n }
+
+# The only profile folders this script will ever delete: exactly <Profiles root>\<profileName>.
+$AppDataRoot = Get-FullPath $env:APPDATA
+$LocalRoot = Get-FullPath $env:LOCALAPPDATA
+$ProfileDir = Join-Path (Join-Path $AppDataRoot "Mozilla\Firefox\Profiles") $m.profileName
+$ProfileLocalDir = Join-Path (Join-Path $LocalRoot "Mozilla\Firefox\Profiles") $m.profileName
+if ((Get-FullPath $m.profileDir) -ine $ProfileDir) { Fail "Manifest profileDir is not $ProfileDir. Refusing to touch it." }
+if ((& $hasProp $m "profileLocalDir") -and $m.profileLocalDir -and (Get-FullPath $m.profileLocalDir) -ine $ProfileLocalDir) {
+    Fail "Manifest profileLocalDir is not $ProfileLocalDir. Refusing to touch it."
+}
+# Remove one file inside the profile: confined to it, no junction on the way.
+function Remove-ProfileFile([string]$f) {
+    if (-not (Test-Under $ProfileDir $f)) { Write-Host "    skipping path outside the profile: $f" -ForegroundColor Yellow; return }
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { return }
+    try { Assert-NoReparse $ProfileDir $f } catch { Write-Host "    skipping: $_" -ForegroundColor Yellow; return }
+    Remove-Item -LiteralPath $f -Force
+    Write-Removed $f
+}
+# Delete a profile folder. [IO.Directory]::Delete does not follow junctions/symlinks inside it.
+function Remove-ProfileFolder([string]$d, [string]$root) {
+    if (-not (Test-Path -LiteralPath $d)) { return $true }
+    try { Assert-NoReparse $root $d } catch { Write-Host "    NOT removed: $_" -ForegroundColor Yellow; return $false }
+    try { [IO.Directory]::Delete($d, $true); Write-Removed $d; return $true }
+    catch { Write-Host "    could not remove ${d}: $($_.Exception.Message)" -ForegroundColor Yellow; return $false }
+}
+$leftovers = @()
 
 # ---------------------------------------------------------------- profile
 if ($m.profileCreated -and -not $KeepProfile) {
     Write-Step "Removing the '$($m.profileName)' profile"
-    Write-Host "    This deletes $($m.profileDir) (bookmarks, logins and history made in the spike profile)."
+    Write-Host "    This deletes $ProfileDir (bookmarks, logins and history made in the spike profile)."
     if (-not $Yes) {
         $ans = Read-Host "    Type YES to delete the spike profile (anything else keeps it)"
         if ($ans -ne "YES") { $KeepProfile = $true; Write-Host "    keeping the profile" }
@@ -105,7 +280,7 @@ if ($m.profileCreated -and -not $KeepProfile) {
             elseif ($cur) { [void]$cur.Lines.Add($l) }
             else { $cur = @{ Name = ""; Lines = (New-Object System.Collections.ArrayList) }; [void]$cur.Lines.Add($l); [void]$sections.Add($cur) }
         }
-        $profDirFull = [IO.Path]::GetFullPath($m.profileDir)
+        $profDirFull = $ProfileDir
         $iniDir = Split-Path -Parent $ini
         $target = $null
         foreach ($s in $sections) {
@@ -115,7 +290,7 @@ if ($m.profileCreated -and -not $KeepProfile) {
             $rel  = ($s.Lines | Where-Object { $_ -match '^IsRelative=1' } | Select-Object -First 1)
             if (-not $name -or -not $path) { continue }
             $p = $path.Substring(5)
-            $full = if ($rel) { [IO.Path]::GetFullPath((Join-Path $iniDir ($p -replace '/', '\'))) } else { [IO.Path]::GetFullPath($p) }
+            $full = if ($rel) { Get-FullPath (Join-Path $iniDir ($p -replace '/', '\')) } else { Get-FullPath $p }
             if ($name.Substring(5) -eq $m.profileName -and $full -ieq $profDirFull) { $target = $s }
         }
         # Refuse if Firefox made our profile an install's default (only happens if it was the only profile).
@@ -154,54 +329,83 @@ if ($m.profileCreated -and -not $KeepProfile) {
         }
     }
     if (-not $KeepProfile) {
-        foreach ($d in @($m.profileDir, $m.profileLocalDir)) {
-            if ($d -and (Test-Path -LiteralPath $d)) {
-                if ((Split-Path -Leaf $d) -ne $m.profileName) { Write-Host "    skipping unexpected path $d" -ForegroundColor Yellow; continue }
-                Remove-Item -LiteralPath $d -Recurse -Force
-                Write-Removed $d
-            }
-        }
+        if (-not (Remove-ProfileFolder $ProfileDir $AppDataRoot)) { $leftovers += $ProfileDir }
+        if (-not (Remove-ProfileFolder $ProfileLocalDir $LocalRoot)) { $leftovers += $ProfileLocalDir }
     }
 }
 if ($KeepProfile -and $m.profileCreated) {
     # Keep the profile but take the mod out of it.
     Write-Step "Keeping the profile; removing termfox + loader files from it"
+    $userJs = Join-Path $ProfileDir "user.js"
     if (& $hasProp $m "profileFiles") {
-        foreach ($f in $m.profileFiles) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; Write-Removed $f } }
+        foreach ($f in @($m.profileFiles)) { if ($f -and ((Get-FullPath $f) -ine $userJs)) { Remove-ProfileFile $f } }
     }
-    foreach ($rel in $OurChromeFiles) {
-        $f = Join-Path (Join-Path $m.profileDir "chrome") $rel
-        if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; Write-Removed $f }
+    foreach ($rel in $OurChromeFiles) { Remove-ProfileFile (Join-Path (Join-Path $ProfileDir "chrome") $rel) }
+    # user.js: remove only the lines an installer wrote; keep the file if you added anything.
+    if ((Test-Path -LiteralPath $userJs -PathType Leaf) -and -not (Test-ReparsePoint $userJs)) {
+        $rest = @([IO.File]::ReadAllLines($userJs) | Where-Object { $OurUserJsLines -notcontains $_.Trim() })
+        if (-not ($rest | Where-Object { $_.Trim() })) { Remove-ProfileFile $userJs }
+        else { [IO.File]::WriteAllLines($userJs, [string[]]$rest); Write-Host "    removed termfox lines from $userJs (kept your own)" -ForegroundColor Green }
     }
     foreach ($d in @("chrome\JS\termfox", "chrome\JS\tilefox", "chrome\JS", "chrome\CSS", "chrome\utils", "chrome")) {
-        $full = Join-Path $m.profileDir $d
-        if ((Test-Path -LiteralPath $full) -and -not (Get-ChildItem -LiteralPath $full -Force)) { Remove-Item -LiteralPath $full -Force; Write-Removed $full }
+        $full = Join-Path $ProfileDir $d
+        if ((Test-Path -LiteralPath $full -PathType Container) -and -not (Test-ReparsePoint $full) -and -not (Get-ChildItem -LiteralPath $full -Force)) {
+            Remove-Item -LiteralPath $full -Force; Write-Removed $full
+        }
     }
+    Write-Host "    Left in the kept profile (yours to delete): termfox.log / tilefox.log if any, the" -ForegroundColor Yellow
+    Write-Host "    devtools.chrome.enabled setting in prefs.js, and termfox window names in its session." -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------- program folder (admin)
-$toRemove = @($m.programFiles | Where-Object { $_.Created })
-if ($toRemove.Count -gt 0) {
-    Write-Step "Admin step: remove files from the Firefox program folder"
-    foreach ($f in $toRemove) { Write-Host "      $($f.Path)" }
-    $resultFile = Join-Path $env:TEMP ("termfox-uninstall-" + [guid]::NewGuid().ToString("N") + ".json")
+# The manifest only says WHICH of the two fixed files the installer created; the elevated step
+# decides everything else for itself.
+$want = @{}
+foreach ($f in @($m.programFiles)) {
+    if ($null -eq $f -or -not $f.Created) { continue }
+    if ($f.Path -like "*\defaults\pref\config-prefs.js") { $want.configPrefs = $true } elseif ($f.Path -like "*\config.js") { $want.configJs = $true }
+}
+$retained = @()
+if ($want.Count -gt 0) {
+    Write-Step "Admin step: remove termfox's files from the Firefox program folder"
+    $resultFile = New-ResultFilePath
     $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$($MyInvocation.MyCommand.Path)`"",
-                 "-ElevatedProgramRemove", "-ManifestFile", "`"$ManifestPath`"", "-ResultFile", "`"$resultFile`"")
+                 "-ElevatedProgramRemove", "-ResultFile", "`"$resultFile`"")
+    if ((& $hasProp $m "firefoxDir") -and $m.firefoxDir) { $argList += @("-FirefoxDirHint", "`"$($m.firefoxDir)`"") }
+    if ($want.configJs) { $argList += "-RemoveConfigJs" }
+    if ($want.configPrefs) { $argList += "-RemoveConfigPrefs" }
     try { Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argList -Wait | Out-Null }
     catch { Fail "Admin prompt cancelled. Program files left in place; the manifest is kept so you can re-run." }
     if (-not (Test-Path -LiteralPath $resultFile)) { Fail "Admin step produced no result. Manifest kept; re-run uninstall.ps1." }
     $r = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
     Remove-Item -LiteralPath $resultFile -Force
-    foreach ($l in $r.log) { Write-Host "    $l" }
+    foreach ($l in @($r.log)) { if ($l) { Write-Host "    $l" } }
     if (-not $r.ok) { Fail "Admin step failed: $($r.error). Manifest kept; re-run uninstall.ps1." }
+    $retained = @($m.programFiles | Where-Object { $_ -and $_.Created -and (
+        ($_.Path -like "*\defaults\pref\config-prefs.js" -and @($r.kept) -contains "configPrefs") -or
+        ($_.Path -like "*\config.js" -and -not ($_.Path -like "*\defaults\pref\config-prefs.js") -and @($r.kept) -contains "configJs")) })
 }
 
 # ---------------------------------------------------------------- manifest
 if ($KeepProfile -and $m.profileCreated) {
-    Write-Host "Profile kept at $($m.profileDir). Remove it later from about:profiles if you want."
+    Write-Host "Profile kept at $ProfileDir. Remove it later from about:profiles if you want."
 }
-Remove-Item -LiteralPath $ManifestDir -Recurse -Force
-Write-Removed $ManifestDir
+if ($retained.Count -gt 0 -or $leftovers.Count -gt 0) {
+    # Something is still on disk: keep a manifest that lists exactly that, so a re-run can finish.
+    $m.programFiles = @($retained)
+    if ($leftovers.Count -eq 0 -and -not $KeepProfile) { $m.profileCreated = $false }
+    $m | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
+    Write-Host ""
+    Write-Host "NOT fully uninstalled. Still on disk:" -ForegroundColor Yellow
+    foreach ($f in $retained) { Write-Host "    $($f.Path)  (changed since install; the Firefox-wide loader may still be active)" -ForegroundColor Yellow }
+    foreach ($d in $leftovers) { Write-Host "    $d" -ForegroundColor Yellow }
+    Write-Host "Manifest kept at $ManifestPath; fix the above and run uninstall.ps1 again." -ForegroundColor Yellow
+    exit 1
+}
+if ((Test-Path -LiteralPath $ManifestDir) -and -not (Test-ReparsePoint $ManifestDir)) {
+    [IO.Directory]::Delete($ManifestDir, $true)
+    Write-Removed $ManifestDir
+}
 Write-Host ""
 Write-Host "termfox uninstalled." -ForegroundColor White
 exit 0

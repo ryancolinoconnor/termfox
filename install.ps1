@@ -5,7 +5,7 @@
 .DESCRIPTION
   1. Finds your Firefox Release install folder.
   2. Downloads fx-autoconfig at a PINNED commit and checks the SHA-256 of every file.
-  3. Asks for admin (UAC) ONLY to copy two files into the Firefox program folder:
+  3. Asks for admin (UAC) ONLY to write two files into the Firefox program folder:
        <Firefox>\config.js
        <Firefox>\defaults\pref\config-prefs.js
   4. Creates a NEW profile "termfox" (firefox.exe -CreateProfile) and puts the
@@ -14,10 +14,18 @@
 
   It never touches any other profile. Close ALL Firefox windows first.
 
-  Note: the two program-folder files are read by every profile of this Firefox install,
-  but config.js does nothing unless a profile has chrome\utils\chrome.manifest, which
-  only the termfox profile has.
+  TRUST MODEL (read SECURITY.md): the two program-folder files turn on a privileged script loader
+  for EVERY profile of this Firefox install. It runs code only from a profile that has
+  chrome\utils\chrome.manifest (only the termfox profile, unless something else adds one), and that
+  code has full browser privileges. If you want the loader confined, install a separate copy of
+  Firefox under Program Files just for termfox and pass it with -FirefoxDir.
   fx-autoconfig: https://github.com/MrOtherGuy/fx-autoconfig#install
+
+  Safety (security audit M4/L1, 2026-10-08): the admin step checks the Firefox folder itself (under
+  Program Files, firefox.exe, no junctions), reads each staged file into memory, checks its SHA-256
+  against the hash hard-coded here, and writes exactly those bytes to a NEW file (never replacing
+  one). The manifest is written as a journal BEFORE the admin step, and a half-done admin step
+  rolls back what it wrote.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -27,7 +35,7 @@ param(
     [string]$FirefoxDir = "",
     [string]$ProfileName = "termfox",
     [switch]$Force,
-    # Internal: used by the elevated child process. Do not pass by hand.
+    # Internal: used by the elevated child process. Checked, never trusted.
     [switch]$ElevatedProgramCopy,
     [string]$StagingDir = "",
     [string]$ResultFile = ""
@@ -36,13 +44,117 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
+# ---------------------------------------------------------------- shared safety helpers
+# (same block in install.ps1 and uninstall.ps1; each script must run on its own)
+#
+# The two program-folder files termfox ever writes, and the only bytes it accepts for them
+# (fx-autoconfig dfdab5684faffc112b76ccb1d8cab7f75da0102c). The elevated steps use these
+# constants and never take a path or a hash from the manifest or the command line.
+$ProgramTargets = @(
+    @{ Key = "configJs";    Rel = "config.js";                     Src = "program/config.js";                     Sha = "80dc421264a3ea04275e1724b7b57234f89254e9582a6c17e9a911b65c3aa6d7" },
+    @{ Key = "configPrefs"; Rel = "defaults\pref\config-prefs.js"; Src = "program/defaults/pref/config-prefs.js"; Sha = "6bfd2ed139d18ff5178e0fc62a3b4058540ddbeba3adc912c0d69edb70c17ece" }
+)
+
+function Get-Sha256([string]$path) { return (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() }
+function Get-BytesSha256([byte[]]$bytes) {
+    $h = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($h.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $h.Dispose() }
+}
+function Get-FullPath([string]$p) { return [IO.Path]::GetFullPath($p).TrimEnd('\') }
+# Is $path strictly inside $root (after canonicalizing both)?
+function Test-Under([string]$root, [string]$path) {
+    return (Get-FullPath $path).StartsWith((Get-FullPath $root) + '\', [StringComparison]::OrdinalIgnoreCase)
+}
+function Test-ReparsePoint([string]$path) {
+    $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+    return [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+}
+# $path and every existing folder between it and $root (inclusive) must be plain: no junction or symlink.
+function Assert-NoReparse([string]$root, [string]$path) {
+    $rootFull = Get-FullPath $root
+    $p = Get-FullPath $path
+    if (($p -ine $rootFull) -and -not (Test-Under $rootFull $p)) { throw "path escapes ${rootFull}: $p" }
+    while ($true) {
+        if ((Test-Path -LiteralPath $p) -and (Test-ReparsePoint $p)) { throw "refusing junction/symlink: $p" }
+        if ($p -ieq $rootFull) { break }
+        $p = Get-FullPath (Split-Path -Parent $p)
+    }
+}
+# Admin-only folders a Firefox install may live in.
+function Get-ProtectedRoots {
+    $roots = @()
+    foreach ($v in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) { if ($v) { $roots += (Get-FullPath $v) } }
+    return @($roots | Select-Object -Unique)
+}
+# HKLM only: HKCU can be changed by any program running as you.
+function Get-RegisteredFirefoxDirs {
+    $out = @()
+    foreach ($root in @("HKLM:\SOFTWARE\Mozilla\Mozilla Firefox", "HKLM:\SOFTWARE\WOW6432Node\Mozilla\Mozilla Firefox")) {
+        try {
+            $cur = (Get-ItemProperty -LiteralPath $root -ErrorAction Stop).CurrentVersion
+            if ($cur) {
+                $main = Get-ItemProperty -LiteralPath "$root\$cur\Main" -ErrorAction Stop
+                if ($main.'Install Directory') { $out += $main.'Install Directory' }
+            }
+        } catch { }
+    }
+    try {
+        $ap = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe" -ErrorAction Stop).'(default)'
+        if ($ap) { $out += (Split-Path -Parent $ap.Trim('"')) }
+    } catch { }
+    if ($env:ProgramFiles) { $out += (Join-Path $env:ProgramFiles "Mozilla Firefox") }
+    return $out
+}
+# A Firefox folder the elevated step may touch: under Program Files (admin-only), no junction or
+# symlink on the way down, firefox.exe present.
+function Test-TrustedFirefoxDir([string]$dir) {
+    if (-not $dir) { return $false }
+    try {
+        $full = Get-FullPath $dir
+        $root = Get-ProtectedRoots | Where-Object { Test-Under $_ $full } | Select-Object -First 1
+        if (-not $root) { return $false }
+        if (-not (Test-Path -LiteralPath (Join-Path $full "firefox.exe") -PathType Leaf)) { return $false }
+        Assert-NoReparse $root $full
+        return $true
+    } catch { return $false }
+}
+# The elevated step's own answer to "which Firefox": the hint only if it passes the checks above
+# (an invalid hint is an error, never silently replaced), else the registered install.
+function Resolve-TrustedFirefoxDir([string]$hint) {
+    if ($hint) {
+        if (Test-TrustedFirefoxDir $hint) { return (Get-FullPath $hint) }
+        throw "not a trusted Firefox folder (must be under Program Files, contain firefox.exe, no junctions): $hint"
+    }
+    foreach ($c in Get-RegisteredFirefoxDirs) { if (Test-TrustedFirefoxDir $c) { return (Get-FullPath $c) } }
+    throw "no Firefox install found under Program Files"
+}
+# One of the two fixed destinations, checked: inside the Firefox folder, no junction on the way.
+function Get-ProgramTargetPath([string]$ffDir, $t) {
+    $dst = Get-FullPath (Join-Path $ffDir $t.Rel)
+    if (-not (Test-Under $ffDir $dst)) { throw "path escape: $dst" }
+    Assert-NoReparse $ffDir $dst
+    return $dst
+}
+# Write exactly these bytes to a NEW file (fails if anything already exists there).
+function Write-NewFile([string]$path, [byte[]]$bytes) {
+    $fs = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true) } finally { $fs.Dispose() }
+}
+# The elevated step only writes its result to a fresh %TEMP%\termfox-result-<32 hex>.json.
+function Assert-ResultFile([string]$path) {
+    $full = Get-FullPath $path
+    if ((Split-Path -Leaf $full) -notmatch '^termfox-result-[0-9a-f]{32}\.json$') { throw "unexpected result file name" }
+    $dir = Split-Path -Parent $full
+    if (-not (Test-Path -LiteralPath $dir -PathType Container) -or (Test-ReparsePoint $dir)) { throw "bad result folder" }
+    if (Test-Path -LiteralPath $full) { throw "result file already exists" }
+    return $full
+}
+function New-ResultFilePath { return (Join-Path $env:TEMP ("termfox-result-" + [guid]::NewGuid().ToString("N") + ".json")) }
+
 # ---------------------------------------------------------------- pinned loader
 $FxacCommit = "dfdab5684faffc112b76ccb1d8cab7f75da0102c"   # fx-autoconfig master, 2026-07-23, loader 0.10.16
 $FxacBase   = "https://raw.githubusercontent.com/MrOtherGuy/fx-autoconfig/$FxacCommit"
-$ProgramFiles = @(
-    @{ Src = "program/config.js";                    Dst = "config.js";                     Sha = "80dc421264a3ea04275e1724b7b57234f89254e9582a6c17e9a911b65c3aa6d7" },
-    @{ Src = "program/defaults/pref/config-prefs.js"; Dst = "defaults\pref\config-prefs.js"; Sha = "6bfd2ed139d18ff5178e0fc62a3b4058540ddbeba3adc912c0d69edb70c17ece" }
-)
+$ProgramFiles = @($ProgramTargets | ForEach-Object { @{ Src = $_.Src; Dst = $_.Rel; Sha = $_.Sha } })
 $ProfileLoaderFiles = @(
     @{ Src = "profile/chrome/utils/boot.sys.mjs";    Dst = "chrome\utils\boot.sys.mjs";    Sha = "1f0b37d765c7b10b963a465a62a420059e334a18b6b48bd8c09059837e676106" },
     @{ Src = "profile/chrome/utils/chrome.manifest"; Dst = "chrome\utils\chrome.manifest"; Sha = "d80557b7bdd46f91f0d249f25f1bf66ed83f8c9e620cd0c9334029e4826924d0" },
@@ -67,37 +179,58 @@ function Test-IsAdmin {
     return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Get-Sha256([string]$path) { return (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() }
+# Read a staged file once, check the bytes in memory, return them (what gets written is what was hashed).
+function Read-VerifiedBytes([string]$path, [string]$sha) {
+    if (Test-ReparsePoint $path) { throw "staged file is a junction/symlink: $path" }
+    $bytes = [IO.File]::ReadAllBytes($path)
+    if ((Get-BytesSha256 $bytes) -ne $sha) { throw "SHA-256 mismatch for staged $path" }
+    return ,$bytes
+}
 
 # ================================================================ elevated child
-# Runs as admin. Copies ONLY the two program files from the verified staging dir.
+# Runs as admin. Writes ONLY the two fixed program files, from verified in-memory bytes, to new
+# files in a Firefox folder it checked itself. On a failure it removes what it wrote in this run.
 if ($ElevatedProgramCopy) {
+    try { $ResultFile = Assert-ResultFile $ResultFile } catch { Write-Host "ERROR: $_" -ForegroundColor Red; Start-Sleep -Seconds 5; exit 1 }
     $written = @()
+    $rolledBack = @()
     try {
-        foreach ($f in $ProgramFiles) {
-            $src = Join-Path $StagingDir $f.Dst
-            $dst = Join-Path $FirefoxDir $f.Dst
-            if ((Get-Sha256 $src) -ne $f.Sha) { throw "staging file hash changed: $src" }
+        $ff = Resolve-TrustedFirefoxDir $FirefoxDir
+        $stage = Get-FullPath $StagingDir
+        foreach ($t in $ProgramTargets) {
+            $dst = Get-ProgramTargetPath $ff $t
             if (Test-Path -LiteralPath $dst) {
-                if ((Get-Sha256 $dst) -eq $f.Sha) {
+                if ((Test-Path -LiteralPath $dst -PathType Leaf) -and (Get-Sha256 $dst) -eq $t.Sha) {
                     Write-Host "    exists (identical, left as is)  $dst"
-                    $written += @{ Path = $dst; Sha = $f.Sha; Created = $false }
+                    $written += @{ Path = $dst; Created = $false }
                     continue
                 }
                 throw "$dst already exists with different content (another autoconfig?). Not overwriting."
             }
+            $src = Join-Path $stage $t.Rel
+            if (-not (Test-Under $stage $src)) { throw "staging path escape: $src" }
+            $bytes = Read-VerifiedBytes $src $t.Sha
             $dir = Split-Path -Parent $dst
-            $createdDir = $false
-            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null; $createdDir = $true }
-            Copy-Item -LiteralPath $src -Destination $dst
+            if (-not (Test-Path -LiteralPath $dir -PathType Container)) { throw "missing folder $dir (not a normal Firefox install?)" }
+            Write-NewFile $dst $bytes
+            $written += @{ Path = $dst; Created = $true }
             Write-Wrote $dst
-            $written += @{ Path = $dst; Sha = $f.Sha; Created = $true; CreatedDir = $createdDir }
         }
-        @{ ok = $true; files = $written } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ResultFile -Encoding UTF8
+        Write-NewFile $ResultFile ([Text.Encoding]::UTF8.GetBytes((@{ ok = $true; files = $written; firefoxDir = $ff } | ConvertTo-Json -Depth 5)))
         exit 0
     } catch {
-        @{ ok = $false; error = "$_"; files = $written } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ResultFile -Encoding UTF8
-        Write-Host "ERROR: $_" -ForegroundColor Red
+        $err = "$_"
+        # Roll back: remove files this run created, if they still hold exactly what was written.
+        foreach ($w in $written) {
+            if (-not $w.Created) { continue }
+            try {
+                $t = $ProgramTargets | Where-Object { $w.Path -like ("*\" + $_.Rel) } | Select-Object -First 1
+                if ($t -and (Get-Sha256 $w.Path) -eq $t.Sha) { Remove-Item -LiteralPath $w.Path -Force; $rolledBack += $w.Path }
+            } catch { }
+        }
+        $left = @($written | Where-Object { $_.Created -and $rolledBack -notcontains $_.Path })
+        Write-NewFile $ResultFile ([Text.Encoding]::UTF8.GetBytes((@{ ok = $false; error = $err; files = $left; rolledBack = $rolledBack } | ConvertTo-Json -Depth 5)))
+        Write-Host "ERROR: $err" -ForegroundColor Red
         Start-Sleep -Seconds 5
         exit 1
     }
@@ -107,6 +240,10 @@ if ($ElevatedProgramCopy) {
 Write-Host ""
 Write-Host "termfox spike installer" -ForegroundColor White
 Write-Host "  fx-autoconfig pinned at $FxacCommit"
+Write-Host ""
+Write-Host "  termfox runs privileged code inside Firefox. The loader it installs applies to every profile" -ForegroundColor Yellow
+Write-Host "  of the Firefox you install it into. Read SECURITY.md first; for the most isolation, use a" -ForegroundColor Yellow
+Write-Host "  separate Firefox install under Program Files and pass it with -FirefoxDir." -ForegroundColor Yellow
 Write-Host ""
 
 if (Test-IsAdmin) {
@@ -128,22 +265,7 @@ if (Get-Process -Name firefox -ErrorAction SilentlyContinue) {
 # ---------------------------------------------------------------- find Firefox Release
 Write-Step "Finding Firefox Release"
 function Find-FirefoxDir {
-    $candidates = @()
-    foreach ($root in @("HKLM:\SOFTWARE\Mozilla\Mozilla Firefox", "HKLM:\SOFTWARE\WOW6432Node\Mozilla\Mozilla Firefox", "HKCU:\SOFTWARE\Mozilla\Mozilla Firefox")) {
-        try {
-            $cur = (Get-ItemProperty -LiteralPath $root -ErrorAction Stop).CurrentVersion
-            if ($cur) {
-                $main = Get-ItemProperty -LiteralPath "$root\$cur\Main" -ErrorAction Stop
-                if ($main.'Install Directory') { $candidates += $main.'Install Directory' }
-            }
-        } catch { }
-    }
-    try {
-        $ap = (Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe" -ErrorAction Stop).'(default)'
-        if ($ap) { $candidates += (Split-Path -Parent $ap.Trim('"')) }
-    } catch { }
-    $candidates += "$env:ProgramFiles\Mozilla Firefox"
-    foreach ($c in $candidates) {
+    foreach ($c in Get-RegisteredFirefoxDirs) {
         if ($c -and (Test-Path -LiteralPath (Join-Path $c "firefox.exe"))) { return (Resolve-Path -LiteralPath $c).Path }
     }
     return $null
@@ -155,6 +277,10 @@ if (-not $FirefoxDir -or -not (Test-Path -LiteralPath (Join-Path $FirefoxDir "fi
 if ($FirefoxDir -like "*\WindowsApps\*") {
     Fail "This is the Microsoft Store (MSIX) Firefox; its program folder is read-only. Install Firefox from mozilla.org."
 }
+if (-not (Test-TrustedFirefoxDir $FirefoxDir)) {
+    Fail "$FirefoxDir must be under Program Files (admin-only) with no junctions; termfox won't install a loader elsewhere."
+}
+$FirefoxDir = Get-FullPath $FirefoxDir
 $FirefoxExe = Join-Path $FirefoxDir "firefox.exe"
 $channel = "unknown"
 $channelFile = Join-Path $FirefoxDir "defaults\pref\channel-prefs.js"
@@ -170,9 +296,13 @@ if ($channel -ne "release" -and -not $Force) {
 }
 
 # Refuse to clobber an existing autoconfig (e.g. an enterprise or other mod setup).
-$existingCfg = Join-Path $FirefoxDir "config.js"
-if ((Test-Path -LiteralPath $existingCfg) -and ((Get-Sha256 $existingCfg) -ne $ProgramFiles[0].Sha)) {
-    Fail "$existingCfg already exists and is not fx-autoconfig $FxacCommit. Not touching it."
+$preexisting = @{}
+foreach ($t in $ProgramTargets) {
+    $p = Join-Path $FirefoxDir $t.Rel
+    if (Test-Path -LiteralPath $p) {
+        if ((Get-Sha256 $p) -ne $t.Sha) { Fail "$p already exists and is not fx-autoconfig $FxacCommit. Not touching it." }
+        $preexisting[$t.Key] = $true
+    }
 }
 Get-ChildItem -LiteralPath (Join-Path $FirefoxDir "defaults\pref") -Filter *.js -ErrorAction SilentlyContinue | ForEach-Object {
     if ($_.Name -ne "channel-prefs.js" -and $_.Name -ne "config-prefs.js" -and (Select-String -LiteralPath $_.FullName -Pattern "general\.config\.filename" -Quiet)) {
@@ -197,11 +327,12 @@ foreach ($f in ($ProgramFiles + $ProfileLoaderFiles)) {
 
 # Our own scripts ship next to this installer.
 $OurChrome = Join-Path $ScriptRoot "profile\chrome"
-foreach ($p in @("JS\termfox.uc.mjs", "JS\termfox_actor.sys.mjs", "JS\termfox\TermfoxChild.sys.mjs", "JS\termfox\TermfoxParent.sys.mjs", "CSS\termfox.uc.css")) {
+foreach ($p in @("JS\termfox.uc.mjs", "JS\termfox_actor.sys.mjs", "JS\termfox\TermfoxChild.sys.mjs", "JS\termfox\TermfoxParent.sys.mjs", "JS\termfox\TermfoxCore.sys.mjs", "CSS\termfox.uc.css")) {
     if (-not (Test-Path -LiteralPath (Join-Path $OurChrome $p))) { Fail "Missing $OurChrome\$p (run install.ps1 from the termfox folder)." }
 }
 
 # ---------------------------------------------------------------- profile path checks (before any write)
+if ($ProfileName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') { Fail "Profile name may use letters, digits, . _ - only." }
 $ProfilesRoot = Join-Path $env:APPDATA "Mozilla\Firefox"
 $ProfilesIni  = Join-Path $ProfilesRoot "profiles.ini"
 $ProfileDir   = Join-Path $ProfilesRoot "Profiles\$ProfileName"
@@ -210,11 +341,27 @@ if ((Test-Path -LiteralPath $ProfilesIni) -and (Select-String -LiteralPath $Prof
     Fail "A profile named '$ProfileName' already exists in $ProfilesIni. Not touching it."
 }
 
-# ---------------------------------------------------------------- elevated: program folder
-Write-Step "Admin step: copy 2 files into the Firefox program folder"
+# ---------------------------------------------------------------- journal, then the elevated step
+# The manifest is written BEFORE the admin step and lists both program files it may create
+# ("Created": true unless already there, identical). uninstall.ps1 deletes a listed file only if it
+# holds exactly the fx-autoconfig bytes, so a journal entry for a file never written is harmless.
+New-Item -ItemType Directory -Path $ManifestDir -Force | Out-Null
+$manifest = [ordered]@{
+    tool = "termfox"; installedAt = (Get-Date).ToString("s"); fxacCommit = $FxacCommit
+    firefoxDir = $FirefoxDir; firefoxVersion = $version
+    programFiles = @($ProgramTargets | ForEach-Object { [ordered]@{ Path = (Join-Path $FirefoxDir $_.Rel); Created = -not $preexisting[$_.Key]; State = "pending" } })
+    profileName = $ProfileName; profileDir = $ProfileDir
+    profileLocalDir = (Join-Path $env:LOCALAPPDATA "Mozilla\Firefox\Profiles\$ProfileName")
+    profileCreated = $false
+}
+function Save-Manifest { $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8 }
+Save-Manifest
+Write-Wrote "$ManifestPath  (journal)"
+
+Write-Step "Admin step: write 2 files into the Firefox program folder"
 Write-Host "    These files will be written (UAC prompt next):"
 foreach ($f in $ProgramFiles) { Write-Host "      $(Join-Path $FirefoxDir $f.Dst)" }
-$resultFile = Join-Path $Staging "elevated-result.json"
+$resultFile = New-ResultFilePath
 $argList = @(
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$($MyInvocation.MyCommand.Path)`"",
     "-ElevatedProgramCopy", "-FirefoxDir", "`"$FirefoxDir`"", "-StagingDir", "`"$Staging`"", "-ResultFile", "`"$resultFile`""
@@ -222,25 +369,28 @@ $argList = @(
 try {
     $proc = Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argList -Wait -PassThru
 } catch {
+    Remove-Item -LiteralPath $ManifestDir -Recurse -Force
     Fail "Admin prompt was cancelled. Nothing was installed."
 }
-if (-not (Test-Path -LiteralPath $resultFile)) { Fail "Admin step produced no result (exit $($proc.ExitCode)). Nothing else was changed." }
-$elev = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
-foreach ($w in $elev.files) { if ($w.Created) { Write-Wrote $w.Path } else { Write-Host "    exists (identical)  $($w.Path)" } }
-if (-not $elev.ok) { Fail "Admin step failed: $($elev.error). Files listed above (if any) were written; run uninstall.ps1 after fixing." }
-
-# Manifest is written as soon as anything exists, so uninstall can always clean up.
-New-Item -ItemType Directory -Path $ManifestDir -Force | Out-Null
-$manifest = [ordered]@{
-    tool = "termfox"; installedAt = (Get-Date).ToString("s"); fxacCommit = $FxacCommit
-    firefoxDir = $FirefoxDir; firefoxVersion = $version
-    programFiles = @($elev.files); profileName = $ProfileName; profileDir = $ProfileDir
-    profileLocalDir = (Join-Path $env:LOCALAPPDATA "Mozilla\Firefox\Profiles\$ProfileName")
-    profileCreated = $false
+if (-not (Test-Path -LiteralPath $resultFile)) {
+    Fail "Admin step produced no result (exit $($proc.ExitCode)). The journal at $ManifestPath is kept; run uninstall.ps1 to clean up."
 }
-function Save-Manifest { $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8 }
+$elev = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
+Remove-Item -LiteralPath $resultFile -Force
+if (-not $elev.ok) {
+    $left = @($elev.files | Where-Object { $_ })
+    if ($left.Count -eq 0) {
+        Remove-Item -LiteralPath $ManifestDir -Recurse -Force
+        Fail "Admin step failed: $($elev.error). It rolled back what it wrote; nothing was installed."
+    }
+    $manifest.programFiles = @($left | ForEach-Object { [ordered]@{ Path = $_.Path; Created = $true; State = "written" } })
+    Save-Manifest
+    Fail "Admin step failed: $($elev.error). Could not roll back: $(($left | ForEach-Object { $_.Path }) -join ', '). Run uninstall.ps1."
+}
+foreach ($w in $elev.files) { if ($w.Created) { Write-Wrote $w.Path } else { Write-Host "    exists (identical)  $($w.Path)" } }
+$manifest.firefoxDir = $elev.firefoxDir
+$manifest.programFiles = @($elev.files | ForEach-Object { [ordered]@{ Path = $_.Path; Created = [bool]$_.Created; State = "written" } })
 Save-Manifest
-Write-Wrote $ManifestPath
 
 # ---------------------------------------------------------------- create the profile
 Write-Step "Creating NEW profile '$ProfileName'"
@@ -265,21 +415,22 @@ $profileFiles = @()
 foreach ($f in $ProfileLoaderFiles) {
     $dst = Join-Path $ProfileDir $f.Dst
     New-Item -ItemType Directory -Path (Split-Path -Parent $dst) -Force | Out-Null
-    Copy-Item -LiteralPath (Join-Path $Staging $f.Dst) -Destination $dst
+    # Re-checked at write time: the bytes written are the bytes whose hash was checked.
+    Write-NewFile $dst (Read-VerifiedBytes (Join-Path $Staging $f.Dst) $f.Sha)
     $profileFiles += $dst; Write-Wrote $dst
 }
 Get-ChildItem -LiteralPath $OurChrome -Recurse -File | ForEach-Object {
     $rel = $_.FullName.Substring($OurChrome.Length).TrimStart('\')
     $dst = Join-Path (Join-Path $ProfileDir "chrome") $rel
     New-Item -ItemType Directory -Path (Split-Path -Parent $dst) -Force | Out-Null
-    Copy-Item -LiteralPath $_.FullName -Destination $dst
+    Write-NewFile $dst ([IO.File]::ReadAllBytes($_.FullName))
     $profileFiles += $dst; Write-Wrote $dst
 }
-# user.js applies only to this profile.
+# user.js applies only to this profile. It deliberately does NOT set termfox.enabled: a pause
+# (Ctrl+Alt+Shift+K) must survive a restart.
 $userJs = Join-Path $ProfileDir "user.js"
 @(
     '// termfox spike profile prefs (this profile only)',
-    'user_pref("termfox.enabled", true);',
     '// Lets the Browser Console (Ctrl+Shift+J) evaluate chrome JS while debugging the spike.',
     'user_pref("devtools.chrome.enabled", true);'
     # DRM prefs deliberately left at Firefox defaults so the DRM test is honest.
@@ -294,5 +445,6 @@ Write-Host ""
 Write-Host "Installed. Start the spike profile with:" -ForegroundColor White
 Write-Host "  & `"$FirefoxExe`" -P $ProfileName -no-remote"
 Write-Host "or double-click launch-termfox.cmd in this folder."
-Write-Host "Your normal Firefox profile is unchanged and still opens as usual."
+Write-Host "Your normal profile is not changed, but the loader is now active for this whole Firefox install;"
+Write-Host "see SECURITY.md. To remove termfox completely, run uninstall.ps1 (pausing is not an off switch)."
 exit 0
