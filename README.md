@@ -9,23 +9,40 @@ This spike answers one question: **do the keys, panes, typing and DRM all surviv
 
 ## What it does
 
-| Key | Action |
-|---|---|
-| **Ctrl+Y** | Split the focused pane: a new pane opens to the **right** (side by side). Replaces Ctrl+Y redo (use **Ctrl+Shift+Z**). Pref `tilefox.keys.splitRight`. |
-| **Ctrl+H** | Split the focused pane: a new pane opens **below**. Replaces "History sidebar". Pref `tilefox.keys.splitDown`. |
-| **Ctrl+←/→/↑/↓** | Move focus to the neighbouring pane, **only** when the focus is not in a text field, editor, URL bar, select or similar. Otherwise the normal word-jump happens. |
-| **Ctrl+Space**, then `y` (right) `h` (down) arrows `p` `x` | Prefix mode: the same actions without the Ctrl combos (`x` = unpane, `p` = palette). Esc cancels. |
-| **Ctrl+Shift+P** | Fuzzy palette over panes (▣) and tabs in all windows. Replaces "New private window" (use the menu). |
-| **Ctrl+Alt+Shift+K** | Kill switch: toggles `tilefox.enabled`. Off means panes dissolve and Firefox's keys come back. |
+The default keymap **mirrors your `~/.tmux.conf`** (spec: [KEYMAP-SPEC.md](KEYMAP-SPEC.md); where tmux.conf binds
+a key twice, the last binding wins). tmux's "vim-aware" keys become "typing-aware": when the focus is in a text
+field, editor, URL bar, select or similar, the key goes to the page instead, just as tmux sends it on to vim.
+
+| Key | tmux.conf | tilefox |
+|---|---|---|
+| **Ctrl+Y** | `C-y` split-window -h (vim-aware) | New pane to the **right**. While typing, passes through (Ctrl+Y = redo there). |
+| **Ctrl+H** | `C-h` split-window -v (vim-aware) | New pane **below**. While typing, passes through. |
+| **Alt+Y** | `M-y` split-window -h | New pane to the **right**, always, even while typing. |
+| **Alt+H** | `M-h` split-window -v | New pane **below**, always. |
+| **Ctrl+←/→/↑/↓** | `C-Left`… select-pane (vim-aware) | Focus the pane in that direction. While typing, passes through (word-jump). Only when a pane layout is on screen. |
+| **Alt+←/→/↑/↓** | `M-Left`… select-pane | Focus the pane in that direction, **always**. This replaces Firefox's Alt+Left/Right Back/Forward: use Vimium `H`/`L` or the toolbar. |
+| **Ctrl+A** | prefix `C-a` | Prefix, only when **not** typing (Ctrl+A select-all still works in fields). |
+| **Ctrl+Space** | (alias) | Prefix, always (also while typing). |
+| prefix then `y` / `h` / arrows | | Split right / split down / move focus |
+| prefix then `r` | `bind r source-file` | Reload: re-reads the keymap prefs and the stylesheet in every window, shows "Reloaded". |
+| prefix then `p` / `x` | | Palette / unpane (turn the focused pane back into a normal tab). Esc cancels. |
+| **Ctrl+Shift+P** | | Fuzzy palette over panes (▣) and tabs in all windows. Replaces "New private window" (use the menu). |
+| **Ctrl+Alt+Shift+K** | | Kill switch: toggles `tilefox.enabled`. Off means panes dissolve and Firefox's keys come back. |
+| mouse | `mouse on` | Click a pane to focus it. |
 
 - Every pane is a **real tab**, so extensions, Vimium, logins and DRM work in it as usual. Closing a pane's
-  tab, or "unpaning" it (Ctrl+Space then x), turns it back into a normal tab.
-- The focused pane (the selected tab) has a blue frame. Clicking a pane focuses it.
+  tab, or "unpaning" it (prefix then x), turns it back into a normal tab.
+- The focused pane (the selected tab) has a blue frame.
 - Selecting a tab that isn't in the layout hides the layout, and selecting one of its tabs brings it back.
 
-To swap or change the split keys, set the string prefs in `about:config`, for example
-`tilefox.keys.splitRight` = `Ctrl+H` and `tilefox.keys.splitDown` = `Ctrl+Y`. The keydown listener picks
-them up at once; restart for the menu-style `<key>` fallback to follow.
+### Changing keys
+
+The table lives in one place (`KEYMAP` in `TilefoxCore.sys.mjs`). Override any entry with a string pref in
+`about:config`, `tilefox.keys.<id>`, for example `tilefox.keys.splitRight` = `Ctrl+H`, or `none` to unbind it.
+Ids: `splitRight`, `splitDown`, `splitRightAlways`, `splitDownAlways`, `focusLeft|Right|Up|Down`,
+`focusLeftAlways|RightAlways|UpAlways|DownAlways`, `prefix`, `prefixAlways`, `palette`, `kill`. The keydown listener
+picks changes up at once (or press prefix then r). Restart for the menu-style `<key>` fallback of the "always"
+keys to follow. Bad values fall back to the default and are logged.
 
 ## Debug log
 
@@ -33,8 +50,9 @@ Every `[tilefox]` line (plus caught errors with stacks) is also appended to
 `%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\tilefox.log` (rotates to `tilefox.log.1` at 1 MB).
 At startup it records the Firefox version, the background-pane painting path
 (`native-splitViewBrowsers`, `switcher-patch` or `docshell-only`), the key map, each hotkey's
-registration and the actor registration. Every Ctrl key it handles is logged with its decision, and content
-actors log their Ctrl+Arrow decisions through the parent.
+registration and the actor registration. Every key press that matches the keymap is logged with its decision
+(taken, passed through and why, or deferred to the page), and content actors log their typing checks through the
+parent. Prefix keys and reloads are logged too.
 
 ## Install (Windows)
 
@@ -71,10 +89,11 @@ installed. Before editing `profiles.ini` it backs the file up to `%TEMP%`.
 
 ## Updating the scripts (after an edit)
 
-Close Firefox, copy the changed files from `profile\chrome\` into
-`%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\chrome\`, start Firefox, then run `about:support` →
-**Clear startup cache…** (or, with Firefox closed, delete
-`%LOCALAPPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\startupCache`). Run `node --test tests/*.test.mjs` before copying. A full `uninstall.ps1` and `install.ps1` also works.
+Run `node --test tests/*.test.mjs`, copy the changed files from `profile\chrome\` into
+`%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\chrome\`, then restart Firefox with `launch-tilefox.cmd`
+(it passes `-purgecaches`, so the startup cache never serves old scripts). Prefix then r applies key prefs and
+the stylesheet live and marks the startup cache stale, but edited `.mjs` files only load after a restart
+(running modules can't be swapped in place). A full `uninstall.ps1` and `install.ps1` also works.
 
 ## Files
 
@@ -101,14 +120,18 @@ profile/chrome/CSS/tilefox.uc.css                 pane geometry, focus frame, pa
   the kill switch is the escape hatch. Smoke-test after each Firefox update.
 - **Firefox's own Split View** (tab context menu → Split View) and tilefox panes don't mix. Tilefox refuses to
   split a tab that's already in a native split.
-- **Ctrl+Y** is no longer redo anywhere; use Ctrl+Shift+Z. **Ctrl+H** no longer opens History; use Ctrl+Shift+H
-  (Library). **Ctrl+Shift+P** no longer opens a private window; use the menu.
+- **Outside text fields**, Ctrl+Y splits instead of redo, Ctrl+H splits instead of opening History (use
+  Ctrl+Shift+H, Library) and Ctrl+A opens the prefix instead of selecting the whole page. Inside fields they keep
+  their normal jobs. **Alt+Left/Right** never go Back/Forward; **Alt+Up/Down** no longer open the URL-bar
+  dropdown. **Ctrl+Shift+P** no longer opens a private window; use the menu.
+- **Typing check needs the content actor.** If a page's actor never reported in (logged as "no content actor
+  seen"), Ctrl+Y/H/Arrow there act as if you were not typing, and Ctrl+A passes through. Use Alt+Y/H/arrows.
 - **Pages that use Ctrl+Arrow** themselves on non-editable content (some slide decks, games) lose it while
   that tab is a pane. Only panes are affected.
 - **Ctrl+Space** may be taken by your Windows IME or input-language switcher before Firefox sees it. Use
-  Ctrl+Shift+P instead.
+  Ctrl+A (outside fields) as the prefix, or Ctrl+Shift+P for the palette.
 - **Privileged pages** (`about:preferences`, `about:addons`) inside a pane: Ctrl+Arrow there falls through to
-  chrome handling and may not move focus. Use Ctrl+Space then an arrow key.
+  chrome handling and may not move focus. Use Alt+arrows.
 - **Security note:** profile scripts run with full browser privileges. Only run reviewed, versioned
   code from this folder.
 - **Untested.** None of this has run in Firefox yet; it was written and statically checked from Linux. See the

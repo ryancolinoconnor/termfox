@@ -28,40 +28,40 @@
  * - The selected tab is the focused pane. If you select a tab that is not in the layout,
  *   the layout is hidden (suspended) and comes back when you select one of its tabs.
  *
- * KEYS
+ * KEYS (mirror ~/.tmux.conf; the table is Core.KEYMAP, overridable with tilefox.keys.<id> prefs)
  * - Primary path: one capture-phase keydown listener on the chrome window. It sees every key
  *   before Firefox's <key> handlers and before the event is forwarded to web content, and logs
- *   each decision. Split keys come from prefs tilefox.keys.splitRight (default Ctrl+Y, pane to
- *   the right) and tilefox.keys.splitDown (default Ctrl+H, pane below).
- * - Secondary path: the same keys as fx-autoconfig Hotkeys (reserved="true", original <key>s
- *   disabled). runAction() dedupes, so a key handled by both paths runs once.
+ *   each decision (Core.routeChromeKey).
+ * - "Always" keys (Alt+Y/H, Alt+Arrow, Ctrl+Space, Ctrl+Shift+P, kill) are taken here. They are
+ *   also fx-autoconfig Hotkeys (reserved="true", original <key>s disabled) as a secondary path;
+ *   runAction() dedupes, so a key handled by both paths runs once.
  *   https://github.com/MrOtherGuy/fx-autoconfig#hotkeys
- * - Ctrl+Arrow: decided in the content process by TilefoxChild (editable check) when that
- *   browser's actor has said hello; otherwise, and for chrome focus, decided here.
+ * - "Pass when typing" keys (Ctrl+Y/H, Ctrl+Arrow, Ctrl+A) aimed at web content are decided in
+ *   the content process by TilefoxChild (editable check) when that browser's actor has said
+ *   hello; otherwise, and for chrome focus, decided here. Their Firefox <key>s stay enabled, so
+ *   a passed-through key still does its normal job (redo, history, select all, word-jump); a
+ *   taken key is preventDefault()ed, which stops the XUL <key> from firing.
  */
 
 const Core = ChromeUtils.importESModule("chrome://userscripts/content/tilefox/TilefoxCore.sys.mjs");
 const PREF_ENABLED = "tilefox.enabled";
-const PREF_KEYS_BRANCH = "tilefox.keys.";
+const PREF_KEYS_BRANCH = Core.KEY_PREF_BRANCH;
 const logger = Core.getLogger();
 const LOG = (...a) => logger.log(...a);
 const ERR = (...a) => logger.error(...a);
 
-// Fixed keys (not configurable in the spike).
-const FIXED = {
-  prefix: Core.parseCombo("Ctrl+Space"),
-  palette: Core.parseCombo("Ctrl+Shift+P"),
-  kill: Core.parseCombo("Ctrl+Alt+Shift+K"),
-};
-const ARROW_DIRS = { ArrowLeft: "left", ArrowRight: "right", ArrowUp: "up", ArrowDown: "down" };
+const ARROW_KEYS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]);
+const SCRIPT_FILES = ["tilefox.uc.mjs", "tilefox_actor.sys.mjs"];
+const STYLE_FILE = "tilefox.uc.css";
 
-// Original Firefox <key> elements that our bindings replace (computed from the key map).
+// Original Firefox <key> elements that our "always" bindings replace (computed from the key map).
 // Matched by key + normalized modifiers instead of id, because ids/labels move between releases.
-//   Ctrl+H        key_gotoHistory   (history sidebar)    browser/base/content/browser-sets.inc.xhtml
-//   Ctrl+Y        key_redo          (Windows redo)       browser/base/content/browser-sets.inc.xhtml
-//   Ctrl+Shift+P  key_privatebrowsing (new private window)
+//   Alt+Left/Right  goBackKb / goForwardKb (Back / Forward)  browser/base/content/browser-sets.inc.xhtml
+//   Ctrl+Shift+P    key_privatebrowsing (new private window)
+// "Pass when typing" keys (Ctrl+Y redo, Ctrl+H history, Ctrl+A select all) are NOT disabled, so
+// they keep working when tilefox passes them through.
 function overriddenKeys(keyMap) {
-  return [keyMap.splitRight, keyMap.splitDown, FIXED.palette, FIXED.prefix].map(Core.comboToOriginalKey);
+  return keyMap.bindings.filter(b => b.typing === "take" && b.action !== "kill").map(b => Core.comboToOriginalKey(b.combo));
 }
 
 class TilefoxWindow {
@@ -92,7 +92,7 @@ class TilefoxWindow {
     for (const p of this.keyMap.problems) {
       ERR("key config:", p);
     }
-    LOG(`key map: split right = ${Core.comboToString(this.keyMap.splitRight)}, split down = ${Core.comboToString(this.keyMap.splitDown)}`);
+    LOG("key map (mirrors ~/.tmux.conf):", Core.describeKeyMap(this.keyMap));
   }
 
   init() {
@@ -155,13 +155,10 @@ class TilefoxWindow {
       ERR("hotkeys: UC_API.Hotkeys missing; only the keydown listener will handle keys");
       return;
     }
-    const defs = [
-      { id: "tilefox-split-right", combo: this.keyMap.splitRight, action: "split-row" },
-      { id: "tilefox-split-down", combo: this.keyMap.splitDown, action: "split-col" },
-      { id: "tilefox-prefix", combo: FIXED.prefix, action: "prefix" },
-      { id: "tilefox-palette", combo: FIXED.palette, action: "palette" },
-      { id: "tilefox-kill", combo: FIXED.kill, action: "kill" },
-    ];
+    // Only "always" keys: a reserved <key> would fire before content could pass a key through.
+    const defs = this.keyMap.bindings
+      .filter(b => b.typing === "take")
+      .map(b => ({ id: b.action === "kill" ? "tilefox-kill" : `tilefox-${b.id}`, combo: b.combo, action: b.action }));
     for (const d of defs) {
       const hk = Core.comboToHotkey(d.combo);
       try {
@@ -280,6 +277,7 @@ class TilefoxWindow {
         case "focus-down": return this.moveFocus(action.slice(6));
         case "unpane": return this.unpane(this.gBrowser.selectedTab);
         case "prefix": return this.openPanel("prefix");
+        case "reload": return this.reload();
         case "palette": return this.openPanel("palette");
       }
       return undefined;
@@ -566,67 +564,41 @@ class TilefoxWindow {
   // Capture-phase keydown on the chrome window: runs before Firefox's <key> handlers and
   // before the event is forwarded to web content.
   onChromeKeydown(e) {
-    if (!e.ctrlKey || (e.repeat && !ARROW_DIRS[e.key])) {
+    if (!e.ctrlKey && !e.altKey) {
       return;
     }
-    const keyName = `${e.ctrlKey ? "Ctrl+" : ""}${e.altKey ? "Alt+" : ""}${e.shiftKey ? "Shift+" : ""}${e.metaKey ? "Meta+" : ""}${e.key}`;
+    const b = Core.bindingFor(this.keyMap, e);
+    if (!b || (e.repeat && !ARROW_KEYS.has(e.key))) {
+      return;
+    }
+    const keyName = Core.comboToString(b.combo);
     const t = e.composedTarget || e.target;
     const where = t?.localName === "browser" ? `browser ${t.browserId}` : `<${t?.localName || "?"}${t?.id ? "#" + t.id : ""}>`;
-    const take = action => {
+    const decide = msg => LOG(`key ${keyName} (code ${e.code}) at ${where} -> ${msg}`);
+    const take = (why, via = "keydown") => {
       e.preventDefault();
       e.stopPropagation();
-      LOG(`key ${keyName} (code ${e.code}) at ${where} -> ${action}`);
-      this.runAction(action, "keydown");
+      decide(`${b.action} (${why})`);
+      this.runAction(b.action, via);
     };
 
-    if (Core.comboMatches(FIXED.kill, e)) {
-      return take("kill");
+    if (b.action === "kill") {
+      return take("kill switch");
     }
     if (!this.enabled) {
-      return;
+      return decide("pass through (tilefox disabled)");
     }
-    const split = Core.splitActionFor(this.keyMap, e);
-    if (split) {
-      return take(split);
-    }
-    if (Core.comboMatches(FIXED.palette, e)) {
-      return take("palette");
-    }
-    if (Core.comboMatches(FIXED.prefix, e)) {
-      return take("prefix");
-    }
-
-    const dir = ARROW_DIRS[e.key];
-    if (!dir || e.altKey || e.metaKey || e.shiftKey) {
-      return;
-    }
-    const decide = msg => LOG(`key ${keyName} at ${where} -> ${msg}`);
-    if (!this.layoutVisible()) {
-      return decide("native (no pane layout on screen)");
-    }
-    if (this.panel?.state === "open") {
-      return decide("native (tilefox panel open)");
-    }
-    // Keys headed into web content arrive here first with the <browser> as target.
-    // TilefoxChild decides for those (it can see the focused element in the page), but only
-    // if that browser's actor is known to be alive; otherwise we decide here.
     const browser = t?.localName === "browser" ? t : t?.closest?.("browser");
-    if (browser) {
-      if (this.actorBrowsers.has(browser)) {
-        return decide("deferred to content actor (editable check in page)");
-      }
-      e.preventDefault();
-      e.stopPropagation();
-      decide(`focus-${dir} (chrome fallback: no content actor seen for browser ${browser.browserId})`);
-      return this.runAction("focus-" + dir, "chrome-fallback");
+    const { verdict, why } = Core.routeChromeKey(b, {
+      inContent: !!browser,
+      actorAlive: !!browser && this.actorBrowsers.has(browser),
+      chromeEditable: !browser && this.chromeEditable(t),
+      layoutVisible: this.layoutVisible(),
+    });
+    if (verdict === "take") {
+      return take(why, browser && b.typing === "pass" ? "chrome-fallback" : "keydown");
     }
-    if (this.chromeEditable(t)) {
-      return decide("native word-jump (focus is in a chrome text field, e.g. the URL bar)");
-    }
-    e.preventDefault();
-    e.stopPropagation();
-    decide("focus-" + dir);
-    this.runAction("focus-" + dir, "chrome");
+    decide(verdict === "defer" ? `deferred to content actor (${why})` : `pass through (${why})`);
   }
 
   chromeEditable(t) {
@@ -685,7 +657,7 @@ class TilefoxWindow {
     this.panel.setAttribute("mode", mode);
     this.input.value = "";
     if (mode === "prefix") {
-      this.hint.textContent = "tilefox  y: split right   h: split down   arrows: move   p: palette   x: unpane   Esc";
+      this.hint.textContent = "tilefox  y: split right   h: split down   arrows: move   r: reload   p: palette   x: unpane   Esc";
       this.prefixTimer = this.win.setTimeout(() => this.closePanel(), 2500);
     } else {
       this.hint.textContent = "Panes (▣) and tabs. Enter: jump, Esc: close";
@@ -713,15 +685,11 @@ class TilefoxWindow {
     if (this.mode === "prefix") {
       e.preventDefault();
       e.stopPropagation();
-      const k = e.key;
-      const map = {
-        y: "split-row", h: "split-col", p: "palette", x: "unpane",
-        ArrowLeft: "focus-left", ArrowRight: "focus-right", ArrowUp: "focus-up", ArrowDown: "focus-down",
-      };
-      const action = map[k] || map[k.toLowerCase?.()];
-      if (["Control", "Shift", "Alt", "Meta"].includes(k)) {
-        return; // modifier still held from Ctrl+Space
+      if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) {
+        return; // modifier still held from Ctrl+A / Ctrl+Space
       }
+      const action = Core.prefixActionFor(e);
+      LOG(`prefix key ${e.key} (code ${e.code}) -> ${action || "cancel"}`);
       if (action === "palette") {
         // switch mode in place (re-opening a panel that is still hiding is unreliable)
         this.win.clearTimeout(this.prefixTimer);
@@ -731,7 +699,7 @@ class TilefoxWindow {
         this.renderPalette();
         return;
       }
-      this.closePanel(!action || action === "unpane");
+      this.closePanel(!action || action === "unpane" || action === "reload");
       if (action) {
         this.runAction(action, "prefix");
       }
@@ -818,6 +786,62 @@ class TilefoxWindow {
     item.win.gBrowser.selectedTab = item.tab;
     item.win.focus();
     item.win.setTimeout(() => item.tab.linkedBrowser?.focus(), 0);
+  }
+
+  // prefix r (tmux: `bind r source-file ~/.tmux.conf; display-message "Reloaded"`).
+  // Re-reads the key map and re-applies key state + layout in every window, re-registers the
+  // stylesheet from disk, and marks the startup cache stale so edited .mjs files load on the
+  // next restart (running ES modules can't be swapped out in place).
+  reload() {
+    LOG("reload requested");
+    let css = false;
+    try {
+      css = !!this.win.UC_API?.Scripts?.reloadStyleSheet(STYLE_FILE);
+    } catch (e) {
+      ERR("reload: stylesheet", e);
+    }
+    let windows = 0;
+    for (const w of Services.wm.getEnumerator("navigator:browser")) {
+      w.Tilefox?.safe(() => {
+        w.Tilefox.loadKeyMap();
+        w.Tilefox.applyKeyState();
+        w.Tilefox.apply();
+        windows++;
+      });
+    }
+    try {
+      Services.appinfo.invalidateCachesOnRestart();
+    } catch (e) {
+      ERR("reload: invalidateCachesOnRestart", e);
+    }
+    const problems = this.keyMap.problems.length;
+    LOG(`reload done: key map + layout in ${windows} window(s), css ${css ? "reloaded" : "NOT reloaded"}, startup cache cleared on next restart (${SCRIPT_FILES.join(", ")} edits apply after restart)`);
+    this.toast(problems ? `Reloaded (${problems} key config problem(s), see tilefox.log)` : "Reloaded");
+  }
+
+  // Brief self-closing message (tmux display-message). Its own panel, so it never takes focus
+  // and never races the prefix panel that is still hiding.
+  toast(text, ms = 1500) {
+    const doc = this.doc;
+    if (!this.toastPanel) {
+      const panel = doc.createXULElement("panel");
+      panel.id = "tilefox-toast";
+      panel.setAttribute("noautofocus", "true");
+      panel.setAttribute("consumeoutsideclicks", "false");
+      const box = doc.createElementNS("http://www.w3.org/1999/xhtml", "div");
+      box.className = "tilefox-box";
+      panel.append(box);
+      (doc.getElementById("mainPopupSet") || doc.documentElement).append(panel);
+      this.toastPanel = panel;
+    }
+    this.toastPanel.firstChild.textContent = `tilefox: ${text}`;
+    this.win.clearTimeout(this.toastTimer);
+    if (this.toastPanel.state === "closed") {
+      const anchor = this.gBrowser.tabpanels;
+      const x = Math.max(0, (anchor.getBoundingClientRect().width - 320) / 2);
+      this.toastPanel.openPopup(anchor, "overlap", x, 40, false, false);
+    }
+    this.toastTimer = this.win.setTimeout(() => this.toastPanel.hidePopup(), ms);
   }
 
   notify(label) {

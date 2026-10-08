@@ -1,5 +1,7 @@
 # tilefox spike: test checklist (about 2 hours, Windows 11)
 
+The keys mirror your `~/.tmux.conf` (README → "What it does", spec in KEYMAP-SPEC.md). Every key decision is in `<profile>\tilefox.log`.
+
 Tick `[x]` for pass and write **FAIL** plus a note for a fail. Work top to bottom: section 0 must pass before you install anything.
 
 Record your Firefox version (`about:support` → Version): __________
@@ -37,21 +39,23 @@ Then install from AMO into the spike profile: **Vimium**, plus uBlock Origin and
 - [ ] Netflix plays **inside a pane**: Ctrl+Y, open Netflix in the new pane, play; the other pane keeps rendering
 - [ ] Fullscreen (F or double-click) on Netflix in a pane fills the screen; Esc returns to the panes
 
-## 3. Split keys, ~10 min
+## 3. Split keys, ~10 min (keymap mirrors your tmux.conf, see README)
 
-- [ ] Ctrl+Y on a normal page: a new pane opens on the **right** (side by side)
+- [ ] Ctrl+Y on a normal page (click page text first): a new pane opens on the **right** (side by side)
 - [ ] Ctrl+H: the current pane splits **downward** (new pane below) and the History sidebar does **not** open
-- [ ] Ctrl+H while typing in a textarea or Gmail compose box still splits (by design) and types no letter
-- [ ] Ctrl+H while the URL bar is focused splits and does not open History
-- [ ] Three or more panes: Ctrl+Y, then Ctrl+H, then Ctrl+Y. Every pane renders and none goes blank
+- [ ] Ctrl+H while typing in a textarea or Gmail compose box does **not** split (passes through, like vim in tmux)
+- [ ] Ctrl+Y while typing in a textarea redoes (type, Ctrl+Z, Ctrl+Y) and does not split
+- [ ] Alt+Y while typing in a textarea splits **right**; Alt+H while typing splits **below**. No letter is typed and the Help menu does not open
+- [ ] Ctrl+H while the URL bar is focused passes through (Firefox may open History there; that is the pass-through). Alt+H there splits
+- [ ] Three or more panes: Ctrl+Y, then Ctrl+H, then Alt+Y. Every pane renders and none goes blank
 - [ ] The focused pane has a blue frame, and clicking another pane moves the frame
-- [ ] Ctrl+Space then **x** "unpanes" the focused tab: it stays open as a normal tab and the remaining panes reflow
+- [ ] Ctrl+A (on page text) then **x** "unpanes" the focused tab: it stays open as a normal tab and the remaining panes reflow
 - [ ] Closing a pane's tab (Ctrl+W) reflows the remaining panes, and with one left the layout disappears
 - [ ] Selecting a non-pane tab in the tab strip hides the layout, and selecting a pane's tab brings it back
 
-## 4. Ctrl+Arrow: focus vs word-jump, ~20 min (have 2+ panes open)
+## 4. Ctrl+Arrow and Alt+Arrow: focus vs word-jump, ~20 min (have 2+ panes open)
 
-Word-jump must still work (the caret moves by a word and focus stays in the field):
+Ctrl+Left/Right word-jump must still work (the caret moves by a word and focus stays in the field):
 - [ ] Gmail compose body
 - [ ] Gmail "To" field (input)
 - [ ] A plain `<textarea>` (for example a GitHub issue comment box)
@@ -62,13 +66,19 @@ Word-jump must still work (the caret moves by a word and focus stays in the fiel
 Focus moves to the neighbouring pane:
 - [ ] Ctrl+Left/Right/Up/Down on a normal page (click on page text first, not in a field) moves the blue frame in that direction
 - [ ] The same inside a cross-origin iframe (for example click inside an embedded YouTube video's area on a news page, then Ctrl+Right)
+- [ ] Alt+Left/Right/Up/Down moves the frame **even while the caret is in a textarea or the URL bar**
+- [ ] Alt+Left does **not** go Back and Alt+Right does not go Forward (Vimium `H`/`L` still do)
 - [ ] With no pane in that direction, nothing happens and nothing breaks
 
-## 5. Prefix fallback and palette, ~10 min
+## 5. Prefix, reload and palette, ~10 min
 
-- [ ] Ctrl+Space shows the hint bar, and **y** (right), **h** (down) and the arrows then work like Ctrl+Y/H/arrows. Esc cancels, and it closes by itself after ~2.5 s
+- [ ] Ctrl+A on page text (not in a field) shows the hint bar; **y** (right), **h** (down) and the arrows then work like Ctrl+Y/H/arrows. Esc cancels, and it closes by itself after ~2.5 s
+- [ ] Ctrl+A inside a textarea or the URL bar selects all text (no hint bar)
+- [ ] Ctrl+Space shows the hint bar even while typing in a textarea
+- [ ] Prefix then **r** shows a short "tilefox: Reloaded" message, and `tilefox.log` has a `reload done` line
+- [ ] Set `about:config` → `tilefox.keys.splitRight` = `Ctrl+U`, then prefix r: Ctrl+U now splits right. Reset the pref afterwards
 - [ ] Ctrl+Shift+P opens the palette (note: this replaces Firefox's "New private window" key; use the menu instead)
-- [ ] Ctrl+Space then **p** also opens the palette
+- [ ] Prefix then **p** also opens the palette
 - [ ] Typing a fuzzy query (for example `gml` for Gmail) filters tabs, ↑/↓ moves and Enter jumps there. Panes are marked ▣1, ▣2…
 - [ ] Tabs from a second window are listed, and Enter switches to that window
 
@@ -84,18 +94,18 @@ In each pane (click it first):
 ## 7. Undo/redo and editors, ~10 min
 
 - [ ] Ctrl+Z undoes in a textarea, Gmail compose and Google Docs
-- [ ] **Ctrl+Shift+Z** redoes in each of these. Ctrl+Y no longer redoes (it splits; this is expected)
+- [ ] **Ctrl+Shift+Z** redoes in each of these, and so does **Ctrl+Y** (it passes through while typing)
 - [ ] Ctrl+Z/Ctrl+Shift+Z in the URL bar
 
 ## 8. IME (only if you use one), ~5 min
 
 - [ ] While composing (the underlined candidate text is visible), Ctrl+Arrow does not move pane focus or break the composition
-- [ ] Note: if your IME uses Ctrl+Space to switch input language, Windows takes that key first, so use Ctrl+Shift+P for the palette
+- [ ] Note: if your IME uses Ctrl+Space to switch input language, Windows takes that key first, so use Ctrl+A (outside fields) as the prefix
 
 ## 9. Kill switch, ~5 min
 
-- [ ] Ctrl+Alt+Shift+K: a "tilefox disabled" bar appears, panes dissolve into normal tabs, Ctrl+H opens **History** again and Ctrl+Y redoes again
-- [ ] Ctrl+Left on a page does nothing special while disabled
+- [ ] Ctrl+Alt+Shift+K: a "tilefox disabled" bar appears, panes dissolve into normal tabs, Ctrl+H opens **History** again, Ctrl+A selects the page and Alt+Left goes Back
+- [ ] Ctrl+Left and Alt+Y on a page do nothing special while disabled
 - [ ] Ctrl+Alt+Shift+K again re-enables it (Ctrl+H splits)
 - [ ] `about:config` → `tilefox.enabled` = false gives the same result as the key
 - [ ] Total off switch: `about:config` → `userChromeJS.enabled` = false, then restart. Nothing from tilefox or the loader runs

@@ -3,8 +3,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   parseCombo, comboToString, comboMatches, comboToHotkey, comboToOriginalKey, resolveKeyMap,
-  splitActionFor, layoutRects, findNeighbour, fuzzy, isEditable, installPaintHook,
-  createFileLogger, KEY_PREFS, DEFAULT_KEYS,
+  bindingFor, actionFor, routeChromeKey, routeContentKey, prefixActionFor, keyPref, KEYMAP,
+  layoutRects, findNeighbour, fuzzy, isEditable, installPaintHook, createFileLogger,
 } from "../profile/chrome/JS/tilefox/TilefoxCore.sys.mjs";
 
 const ev = (key, mods = {}, code) => ({
@@ -13,17 +13,143 @@ const ev = (key, mods = {}, code) => ({
 });
 const ctrl = { ctrlKey: true };
 
-// ---- key mapping (Ryan 2026-10-08: Ctrl+Y = right, Ctrl+H = below)
+const alt = { altKey: true };
+const km = resolveKeyMap(() => "");
+const b = (key, mods, code) => bindingFor(km, ev(key, mods, code));
 
-test("defaults: Ctrl+Y splits right, Ctrl+H splits down", () => {
-  assert.equal(DEFAULT_KEYS.splitRight, "Ctrl+Y");
-  assert.equal(DEFAULT_KEYS.splitDown, "Ctrl+H");
-  const km = resolveKeyMap(() => "");
-  assert.equal(splitActionFor(km, ev("y", ctrl)), "split-row"); // row = side by side
-  assert.equal(splitActionFor(km, ev("h", ctrl)), "split-col"); // col = stacked
-  assert.equal(splitActionFor(km, ev("h", { ctrlKey: true, shiftKey: true })), null);
-  assert.equal(splitActionFor(km, ev("h")), null);
+// ---- key map: mirrors ~/.tmux.conf (KEYMAP-SPEC.md, 2026-10-08)
+
+test("default key map mirrors tmux.conf", () => {
   assert.deepEqual(km.problems, []);
+  const table = Object.fromEntries(km.bindings.map(x => [comboToString(x.combo), `${x.action}/${x.typing}`]));
+  assert.deepEqual(table, {
+    "Ctrl+Y": "split-row/pass", // C-y split-window -h, vim-aware
+    "Ctrl+H": "split-col/pass", // C-h split-window -v, vim-aware
+    "Alt+Y": "split-row/take", // M-y split-window -h (last M-y binding in tmux.conf)
+    "Alt+H": "split-col/take", // M-h split-window -v (last M-h binding)
+    "Ctrl+ArrowLeft": "focus-left/pass", "Ctrl+ArrowRight": "focus-right/pass",
+    "Ctrl+ArrowUp": "focus-up/pass", "Ctrl+ArrowDown": "focus-down/pass",
+    "Alt+ArrowLeft": "focus-left/take", "Alt+ArrowRight": "focus-right/take",
+    "Alt+ArrowUp": "focus-up/take", "Alt+ArrowDown": "focus-down/take",
+    "Ctrl+A": "prefix/pass", // prefix C-a, only when not typing
+    "Ctrl+Space": "prefix/take", // always-on alias
+    "Ctrl+Shift+P": "palette/take",
+    "Ctrl+Alt+Shift+K": "kill/take",
+  });
+});
+
+test("key events resolve to the right binding (exact modifiers)", () => {
+  assert.equal(b("y", ctrl).action, "split-row");
+  assert.equal(b("h", ctrl).action, "split-col");
+  assert.equal(b("y", alt).action, "split-row");
+  assert.equal(b("h", alt).typing, "take");
+  assert.equal(b("ArrowLeft", ctrl).action, "focus-left");
+  assert.equal(b("ArrowDown", alt).action, "focus-down");
+  assert.equal(b("a", ctrl).action, "prefix");
+  assert.equal(b(" ", ctrl, "Space").action, "prefix");
+  assert.equal(b("ArrowLeft", { ctrlKey: true, shiftKey: true }), null); // select word stays native
+  assert.equal(b("h", { ctrlKey: true, shiftKey: true }), null);
+  assert.equal(b("a", { ctrlKey: true, altKey: true }), null);
+  assert.equal(b("h"), null);
+  assert.equal(actionFor(km, ev("y", alt)), "split-row");
+});
+
+// ctx helpers for the chrome-side router
+const content = (extra = {}) => ({ inContent: true, actorAlive: true, chromeEditable: false, layoutVisible: true, ...extra });
+const chrome = (extra = {}) => ({ inContent: false, actorAlive: false, chromeEditable: false, layoutVisible: true, ...extra });
+const v = (r) => r.verdict;
+
+test("Ctrl+Y / Ctrl+H: split when not typing, pass through when typing", () => {
+  for (const key of ["y", "h"]) {
+    const x = b(key, ctrl);
+    assert.equal(v(routeChromeKey(x, content())), "defer"); // content actor checks the field
+    assert.equal(v(routeContentKey(x, { editable: true, isPane: true })), "pass");
+    assert.equal(v(routeContentKey(x, { editable: false, isPane: false })), "take"); // splits from a plain tab too
+    assert.equal(v(routeChromeKey(x, chrome({ chromeEditable: true }))), "pass"); // URL bar
+    assert.equal(v(routeChromeKey(x, chrome())), "take");
+    assert.equal(v(routeChromeKey(x, content({ actorAlive: false }))), "take"); // fallback
+  }
+});
+
+test("Alt+Y / Alt+H always split, even while typing", () => {
+  for (const key of ["y", "h"]) {
+    const x = b(key, alt);
+    assert.equal(v(routeChromeKey(x, content())), "take");
+    assert.equal(v(routeChromeKey(x, chrome({ chromeEditable: true }))), "take");
+    assert.equal(v(routeContentKey(x, { editable: true, isPane: true })), "take");
+  }
+});
+
+test("Ctrl+Arrow selects a pane, passes through when typing or with no layout", () => {
+  const x = b("ArrowRight", ctrl);
+  assert.equal(v(routeChromeKey(x, content())), "defer");
+  assert.equal(v(routeContentKey(x, { editable: true, isPane: true })), "pass"); // word-jump
+  assert.equal(v(routeContentKey(x, { editable: false, isPane: true })), "take");
+  assert.equal(v(routeContentKey(x, { editable: false, isPane: false })), "pass");
+  assert.equal(v(routeChromeKey(x, chrome({ chromeEditable: true }))), "pass");
+  assert.equal(v(routeChromeKey(x, chrome({ layoutVisible: false }))), "pass");
+});
+
+test("Alt+Arrow always selects a pane (Back/Forward suppressed)", () => {
+  const x = b("ArrowLeft", alt);
+  assert.equal(v(routeChromeKey(x, content())), "take");
+  assert.equal(v(routeChromeKey(x, chrome({ chromeEditable: true }))), "take");
+  assert.equal(v(routeChromeKey(x, chrome({ layoutVisible: false }))), "take");
+  assert.deepEqual(comboToOriginalKey(x.combo), { keycode: "VK_LEFT", mods: "alt" }); // goBackKb
+});
+
+test("Ctrl+A is the prefix only when not typing; Ctrl+Space always", () => {
+  const a = b("a", ctrl);
+  assert.equal(v(routeChromeKey(a, content())), "defer");
+  assert.equal(v(routeContentKey(a, { editable: true, isPane: false })), "pass"); // select all
+  assert.equal(v(routeContentKey(a, { editable: false, isPane: false })), "take");
+  assert.equal(v(routeChromeKey(a, chrome({ chromeEditable: true }))), "pass");
+  assert.equal(v(routeChromeKey(a, content({ actorAlive: false }))), "pass"); // can't check: keep select-all
+  const sp = b(" ", ctrl, "Space");
+  assert.equal(v(routeChromeKey(sp, chrome({ chromeEditable: true }))), "take");
+  assert.equal(v(routeChromeKey(sp, content())), "take");
+});
+
+test("prefix keys: y h arrows r p x, with or without Ctrl held", () => {
+  assert.equal(prefixActionFor(ev("r")), "reload");
+  assert.equal(prefixActionFor(ev("r", ctrl)), "reload");
+  assert.equal(prefixActionFor(ev("R", { shiftKey: true })), "reload");
+  assert.equal(prefixActionFor(ev("y")), "split-row");
+  assert.equal(prefixActionFor(ev("\b", ctrl, "KeyH")), "split-col"); // Ctrl+H as backspace char
+  assert.equal(prefixActionFor(ev("ArrowUp")), "focus-up");
+  assert.equal(prefixActionFor(ev("p")), "palette");
+  assert.equal(prefixActionFor(ev("x")), "unpane");
+  assert.equal(prefixActionFor(ev("Control")), null);
+  assert.equal(prefixActionFor(ev("q")), null);
+});
+
+test("prefs override the table: rebind, swap, unbind", () => {
+  const prefs = { [keyPref("splitRight")]: "Ctrl+H", [keyPref("splitDown")]: "ctrl + y", [keyPref("prefix")]: "none" };
+  const k = resolveKeyMap(n => prefs[n] || "");
+  assert.deepEqual(k.problems, []);
+  assert.equal(actionFor(k, ev("h", ctrl)), "split-row");
+  assert.equal(actionFor(k, ev("y", ctrl)), "split-col");
+  assert.equal(actionFor(k, ev("a", ctrl)), null);
+  assert.equal(actionFor(k, ev(" ", ctrl, "Space")), "prefix");
+  assert.equal(keyPref("splitRight"), "tilefox.keys.splitRight"); // pref names from the first spike still work
+});
+
+test("bad pref values fall back to defaults; clashes are reported", () => {
+  const k = resolveKeyMap(n => (n === keyPref("splitDown") ? "Ctrl+Banana" : ""));
+  assert.equal(comboToString(bindingFor(k, ev("h", ctrl)).combo), "Ctrl+H");
+  assert.equal(k.problems.length, 1);
+  assert.match(k.problems[0], /tilefox\.keys\.splitDown/);
+  const clash = resolveKeyMap(n => (n === keyPref("palette") ? "Ctrl+Y" : ""));
+  assert.equal(actionFor(clash, ev("y", ctrl)), "split-row"); // table order wins
+  assert.match(clash.problems[0], /palette and splitRight are both Ctrl\+Y/);
+});
+
+test("every table entry parses and has a tmux note", () => {
+  for (const d of KEYMAP) {
+    assert.ok(parseCombo(d.combo), d.combo);
+    assert.ok(["pass", "take"].includes(d.typing), d.id);
+    assert.ok(d.tmux, d.id);
+  }
 });
 
 test("split-row puts the new pane to the right, split-col below", () => {
@@ -31,20 +157,6 @@ test("split-row puts the new pane to the right, split-col below", () => {
   assert.deepEqual(right.get("B"), { x: 50, y: 0, w: 50, h: 100 });
   const down = layoutRects({ dir: "col", a: { tab: "A" }, b: { tab: "B" }, ratio: 0.5 });
   assert.deepEqual(down.get("B"), { x: 0, y: 50, w: 100, h: 50 });
-});
-
-test("prefs flip the mapping without code changes", () => {
-  const prefs = { [KEY_PREFS.splitRight]: "Ctrl+H", [KEY_PREFS.splitDown]: "ctrl + y" };
-  const km = resolveKeyMap(n => prefs[n] || "");
-  assert.equal(splitActionFor(km, ev("h", ctrl)), "split-row");
-  assert.equal(splitActionFor(km, ev("y", ctrl)), "split-col");
-});
-
-test("bad pref values fall back to defaults and are reported", () => {
-  const km = resolveKeyMap(n => (n === KEY_PREFS.splitDown ? "Ctrl+Banana" : ""));
-  assert.equal(comboToString(km.splitDown), "Ctrl+H");
-  assert.equal(km.problems.length, 1);
-  assert.match(km.problems[0], /tilefox\.keys\.splitDown/);
 });
 
 test("letters match by physical key code too (layout / IME changes ev.key)", () => {
@@ -66,6 +178,8 @@ test("parseCombo / comboToString / hotkey args", () => {
   assert.deepEqual(comboToOriginalKey(parseCombo("Ctrl+H")), { key: "h", mods: "accel" });
   assert.deepEqual(comboToOriginalKey(parseCombo("Ctrl+Shift+P")), { key: "p", mods: "accel,shift" });
   assert.deepEqual(comboToOriginalKey(parseCombo("Ctrl+Space")), { keycode: "VK_SPACE", mods: "accel" });
+  assert.deepEqual(comboToHotkey(parseCombo("Alt+Left")), { modifiers: "alt", key: "VK_LEFT" });
+  assert.deepEqual(comboToHotkey(parseCombo("Alt+Y")), { modifiers: "alt", key: "Y" });
 });
 
 // ---- focus navigation geometry

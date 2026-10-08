@@ -4,11 +4,13 @@
  * content process. Chrome code cannot synchronously see whether the focused element
  * inside a remote page (or a cross-origin, out-of-process iframe) is editable. So this
  * actor makes the decision where the focus actually lives:
- *   - Ctrl+Arrow in an editable element  -> do nothing (native word-jump runs)
- *   - Ctrl+Arrow elsewhere, and this tab is a tilefox pane -> eat the key, ask the parent
- *     to move pane focus
- *   - split keys (tilefox.keys.splitRight / splitDown) -> fallback only. The chrome window's
- *     capture keydown listener normally handles them before content sees them.
+ *   - a "pass when typing" key (Ctrl+Y, Ctrl+H, Ctrl+A, Ctrl+Arrow; see KEYMAP in
+ *     TilefoxCore) in an editable element -> do nothing, the page/field gets it (word-jump,
+ *     select-all, redo...). Like tmux's vim-aware `send-keys`.
+ *   - the same key elsewhere -> eat it and ask the parent to run the action
+ *     (Ctrl+Arrow only when this tab is a tilefox pane)
+ *   - "always" keys (Alt+Y/H, Alt+Arrow, Ctrl+Space...) -> fallback only. The chrome window's
+ *     capture keydown listener normally takes them before content sees them.
  * On every top-level pageshow it says hello, so the parent knows this browser has a working
  * actor (otherwise the window handles Ctrl+Arrow itself). Decisions are sent to the parent
  * as "Tilefox:Log" because the content sandbox can't write the profile's tilefox.log.
@@ -18,16 +20,9 @@
  *   https://searchfox.org/mozilla-central/source/dom/ipc/SharedMap.h
  */
 
-import { isEditable, resolveKeyMap, splitActionFor } from "./TilefoxCore.sys.mjs";
+import { bindingFor, comboToString, isEditable, resolveKeyMap, routeContentKey } from "./TilefoxCore.sys.mjs";
 
 export { isEditable };
-
-const ARROWS = {
-  ArrowLeft: "focus-left",
-  ArrowRight: "focus-right",
-  ArrowUp: "focus-up",
-  ArrowDown: "focus-down",
-};
 
 function deepActiveElement(doc) {
   let el = doc.activeElement;
@@ -65,7 +60,7 @@ export class TilefoxChild extends JSWindowActorChild {
     if (event.type !== "keydown" || event.defaultPrevented || event.isComposing) {
       return;
     }
-    if (!event.ctrlKey) {
+    if (!event.ctrlKey && !event.altKey) {
       return;
     }
     if (!Services.prefs.getBoolPref("tilefox.enabled", true)) {
@@ -73,39 +68,28 @@ export class TilefoxChild extends JSWindowActorChild {
     }
 
     const keyMap = resolveKeyMap(name => Services.prefs.getStringPref(name, ""));
-    const split = splitActionFor(keyMap, event);
-    if (split) {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      this.log(`content: ${event.code} reached content (chrome listener missed it) -> ${split}`);
-      this.sendAsyncMessage("Tilefox:Action", { action: split, via: "content-fallback" });
+    const b = bindingFor(keyMap, event);
+    if (!b || b.action === "kill") {
       return;
     }
 
-    const action = ARROWS[event.key];
-    if (!action || event.shiftKey || event.altKey || event.metaKey) {
-      return; // Ctrl+Shift+Arrow = select word: always native
-    }
-
-    // Only steal Ctrl+Arrow when this tab is currently a tilefox pane.
     const panes = Services.cpmm.sharedData.get("tilefox:paneBrowserIds");
     const browserId = this.browsingContext?.browserId;
-    if (!panes || !browserId || !panes.includes(browserId)) {
-      this.log(`content: ${event.key} ignored, browser ${browserId} is not a pane (panes: ${JSON.stringify(panes || [])})`);
-      return;
-    }
-
     const doc = this.document;
     const el = deepActiveElement(doc);
-    if (isEditable(el, doc)) {
-      this.log(`content: ${event.key} in editable <${el?.localName}> -> native word-jump`);
+    const { verdict, why } = routeContentKey(b, {
+      editable: isEditable(el, doc),
+      isPane: !!(panes && browserId && panes.includes(browserId)),
+    });
+    const key = comboToString(b.combo);
+    if (verdict === "pass") {
+      this.log(`content: ${key} on <${el?.localName || "none"}> -> pass through (${why})`);
       return;
     }
-
     event.preventDefault();
     event.stopImmediatePropagation();
-    this.log(`content: ${event.key} on <${el?.localName || "none"}> -> ${action}`);
-    this.sendAsyncMessage("Tilefox:Action", { action, via: "content" });
+    this.log(`content: ${key} on <${el?.localName || "none"}> -> ${b.action} (${why})`);
+    this.sendAsyncMessage("Tilefox:Action", { action: b.action, via: b.typing === "take" ? "content-fallback" : "content" });
   }
 
   receiveMessage() {}

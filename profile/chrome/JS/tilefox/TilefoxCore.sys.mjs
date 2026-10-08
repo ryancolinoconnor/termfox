@@ -8,16 +8,6 @@
 
 // ---------------------------------------------------------------- key combos
 
-// Configurable through about:config (string prefs). Ryan, 2026-10-08: Ctrl+Y = right, Ctrl+H = below.
-export const KEY_PREFS = {
-  splitRight: "tilefox.keys.splitRight",
-  splitDown: "tilefox.keys.splitDown",
-};
-export const DEFAULT_KEYS = {
-  splitRight: "Ctrl+Y",
-  splitDown: "Ctrl+H",
-};
-
 const NAMED_KEYS = {
   space: " ",
   left: "ArrowLeft", arrowleft: "ArrowLeft",
@@ -128,41 +118,146 @@ export function normMods(s) {
     .join(",");
 }
 
-/**
- * Resolve the configured split keys. getPref(name) returns the string pref or "".
- * Bad values fall back to the defaults and are reported in `problems`.
+// ---------------------------------------------------------------- key map (mirrors ~/.tmux.conf)
+
+/*
+ * One table, mirroring Ryan's ~/.tmux.conf (KEYMAP-SPEC.md, 2026-10-08; last binding wins there).
+ *   typing: "pass" = like tmux's vim-aware `if-shell "$is_vim" "send-keys ..."`: when focus is in an
+ *                    editable field the key goes to the page/field untouched (no Firefox key is
+ *                    disabled, so Ctrl+Y redo, Ctrl+H history and Ctrl+A select-all still work there).
+ *           "take" = like a plain `bind -n`: always tilefox, even while typing. The Firefox <key>s on
+ *                    that combo are disabled while tilefox is enabled.
+ *   noActor: what to do with a "pass" key aimed at web content whose content actor never said hello
+ *            (so nobody can check editability): "take" (default) or "pass".
+ * Every combo can be overridden with the string pref tilefox.keys.<id> ("none" unbinds it).
  */
-export function resolveKeyMap(getPref) {
-  const out = { problems: [] };
-  for (const name of Object.keys(DEFAULT_KEYS)) {
-    const raw = (getPref(KEY_PREFS[name]) || "").trim();
+export const KEYMAP = [
+  { id: "splitRight",       combo: "Ctrl+Y",     action: "split-row",   typing: "pass", tmux: "C-y split-window -h (vim-aware)" },
+  { id: "splitDown",        combo: "Ctrl+H",     action: "split-col",   typing: "pass", tmux: "C-h split-window -v (vim-aware)" },
+  { id: "splitRightAlways", combo: "Alt+Y",      action: "split-row",   typing: "take", tmux: "M-y split-window -h" },
+  { id: "splitDownAlways",  combo: "Alt+H",      action: "split-col",   typing: "take", tmux: "M-h split-window -v" },
+  { id: "focusLeft",        combo: "Ctrl+Left",  action: "focus-left",  typing: "pass", tmux: "C-Left select-pane -L (vim-aware)" },
+  { id: "focusRight",       combo: "Ctrl+Right", action: "focus-right", typing: "pass", tmux: "C-Right select-pane -R (vim-aware)" },
+  { id: "focusUp",          combo: "Ctrl+Up",    action: "focus-up",    typing: "pass", tmux: "C-Up select-pane -U (vim-aware)" },
+  { id: "focusDown",        combo: "Ctrl+Down",  action: "focus-down",  typing: "pass", tmux: "C-Down select-pane -D (vim-aware)" },
+  { id: "focusLeftAlways",  combo: "Alt+Left",   action: "focus-left",  typing: "take", tmux: "M-Left select-pane -L" },
+  { id: "focusRightAlways", combo: "Alt+Right",  action: "focus-right", typing: "take", tmux: "M-Right select-pane -R" },
+  { id: "focusUpAlways",    combo: "Alt+Up",     action: "focus-up",    typing: "take", tmux: "M-Up select-pane -U" },
+  { id: "focusDownAlways",  combo: "Alt+Down",   action: "focus-down",  typing: "take", tmux: "M-Down select-pane -D" },
+  { id: "prefix",           combo: "Ctrl+A",     action: "prefix",      typing: "pass", noActor: "pass", tmux: "prefix C-a" },
+  { id: "prefixAlways",     combo: "Ctrl+Space", action: "prefix",      typing: "take", tmux: "(tilefox alias for the prefix)" },
+  { id: "palette",          combo: "Ctrl+Shift+P", action: "palette",   typing: "take", tmux: "(tilefox only)" },
+  { id: "kill",             combo: "Ctrl+Alt+Shift+K", action: "kill",  typing: "take", tmux: "(tilefox only)" },
+];
+
+// After the prefix (tmux: C-a <key>). Letters match with or without Ctrl still held.
+export const PREFIX_KEYS = {
+  y: "split-row", h: "split-col", r: "reload", p: "palette", x: "unpane",
+  ArrowLeft: "focus-left", ArrowRight: "focus-right", ArrowUp: "focus-up", ArrowDown: "focus-down",
+};
+
+export const KEY_PREF_BRANCH = "tilefox.keys.";
+export const keyPref = id => KEY_PREF_BRANCH + id;
+
+/**
+ * KEYMAP + prefs -> {bindings: [{id, combo, action, typing, noActor, tmux}], problems: [...]}.
+ * getPref(name) returns the string pref or "". Bad values fall back to the default and are
+ * reported; "none" unbinds. Two bindings on one combo: the first in the table wins (reported).
+ */
+export function resolveKeyMap(getPref, table = KEYMAP) {
+  const bindings = [];
+  const problems = [];
+  const seen = new Map();
+  for (const def of table) {
+    const raw = (getPref(keyPref(def.id)) || "").trim();
+    if (raw.toLowerCase() === "none") {
+      continue;
+    }
     let combo = raw ? parseCombo(raw) : null;
     if (raw && !combo) {
-      out.problems.push(`${KEY_PREFS[name]}="${raw}" is not a valid key; using ${DEFAULT_KEYS[name]}`);
+      problems.push(`${keyPref(def.id)}="${raw}" is not a valid key; using ${def.combo}`);
     }
-    if (!combo) {
-      combo = parseCombo(DEFAULT_KEYS[name]);
+    combo ||= parseCombo(def.combo);
+    const name = comboToString(combo);
+    if (seen.has(name)) {
+      problems.push(`${def.id} and ${seen.get(name)} are both ${name}; ${seen.get(name)} wins`);
+      continue;
     }
-    out[name] = combo;
+    seen.set(name, def.id);
+    bindings.push({ ...def, combo, noActor: def.noActor || "take" });
   }
-  if (comboToString(out.splitRight) === comboToString(out.splitDown)) {
-    out.problems.push(`splitRight and splitDown are both ${comboToString(out.splitRight)}; splitDown wins`);
-  }
-  return out;
+  return { bindings, problems };
 }
 
-// split-row = new pane to the RIGHT (side by side); split-col = new pane BELOW.
-export const SPLIT_ACTIONS = { splitRight: "split-row", splitDown: "split-col" };
+/** The binding a keydown matches, or null. */
+export function bindingFor(keyMap, ev) {
+  return keyMap.bindings.find(b => comboMatches(b.combo, ev)) || null;
+}
 
-/** Which split action (if any) a keydown triggers. */
-export function splitActionFor(keyMap, ev) {
-  if (comboMatches(keyMap.splitDown, ev)) {
-    return SPLIT_ACTIONS.splitDown;
+/** Which action (if any) a keydown triggers, ignoring typing state. */
+export function actionFor(keyMap, ev) {
+  return bindingFor(keyMap, ev)?.action || null;
+}
+
+export function describeKeyMap(keyMap) {
+  return keyMap.bindings.map(b => `${comboToString(b.combo)}=${b.action}${b.typing === "pass" ? "(pass when typing)" : ""}`).join(", ");
+}
+
+const isFocusAction = a => a.startsWith("focus-");
+
+/**
+ * Chrome-window decision for a matched binding. ctx:
+ *   inContent      the keydown is headed into a <browser> (web content)
+ *   actorAlive     that browser's content actor has said hello (it can check editability)
+ *   chromeEditable focus is in a chrome text field (URL bar, search bar, palette input)
+ *   layoutVisible  a pane layout is on screen
+ * Returns {verdict: "take"|"pass"|"defer", why}. "defer" = let the content actor decide.
+ */
+export function routeChromeKey(b, ctx) {
+  if (b.typing === "take") {
+    return { verdict: "take", why: "always-on binding" };
   }
-  if (comboMatches(keyMap.splitRight, ev)) {
-    return SPLIT_ACTIONS.splitRight;
+  if (isFocusAction(b.action) && !ctx.layoutVisible) {
+    return { verdict: "pass", why: "no pane layout on screen" };
   }
-  return null;
+  if (ctx.inContent) {
+    if (ctx.actorAlive) {
+      return { verdict: "defer", why: "content actor checks for an editable field" };
+    }
+    return b.noActor === "pass"
+      ? { verdict: "pass", why: "no content actor seen, cannot check typing; passing through" }
+      : { verdict: "take", why: "chrome fallback: no content actor seen" };
+  }
+  if (ctx.chromeEditable) {
+    return { verdict: "pass", why: "typing in a chrome text field" };
+  }
+  return { verdict: "take", why: "not typing" };
+}
+
+/**
+ * Content-actor decision for a matched binding. ctx: {editable, isPane}.
+ * "take" bindings normally never reach content (chrome took them); here they are a fallback.
+ */
+export function routeContentKey(b, ctx) {
+  if (b.typing === "take") {
+    return { verdict: "take", why: "always-on binding reached content (chrome listener missed it)" };
+  }
+  if (isFocusAction(b.action) && !ctx.isPane) {
+    return { verdict: "pass", why: "this tab is not a pane" };
+  }
+  if (ctx.editable) {
+    return { verdict: "pass", why: "typing in an editable field" };
+  }
+  return { verdict: "take", why: "not typing" };
+}
+
+/** Prefix-mode key -> action (tmux: C-a <key>). Modifier-only presses return null. */
+export function prefixActionFor(ev) {
+  if (["Control", "Shift", "Alt", "Meta"].includes(ev.key)) {
+    return null;
+  }
+  return PREFIX_KEYS[ev.key] || PREFIX_KEYS[(ev.key || "").toLowerCase()]
+    || (/^Key[A-Z]$/.test(ev.code || "") ? PREFIX_KEYS[ev.code.slice(3).toLowerCase()] : undefined) || null;
 }
 
 // ---------------------------------------------------------------- layout geometry
