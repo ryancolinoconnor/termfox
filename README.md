@@ -19,8 +19,8 @@ field, editor, URL bar, select or similar, the key goes to the page instead, jus
 | **Ctrl+H** | `C-h` split-window -v (vim-aware) | New pane **below**. While typing, passes through. |
 | **Alt+Y** | `M-y` split-window -h | New pane to the **right**, always, even while typing. |
 | **Alt+H** | `M-h` split-window -v | New pane **below**, always. |
-| **Ctrl+←/→/↑/↓** | `C-Left`… select-pane (vim-aware) | Focus the pane in that direction. While typing, passes through (word-jump). Only when a pane layout is on screen. |
-| **Alt+←/→/↑/↓** | `M-Left`… select-pane | Focus the pane in that direction, **always**. This replaces Firefox's Alt+Left/Right Back/Forward: use Vimium `H`/`L` or the toolbar. |
+| **Ctrl+←/→/↑/↓** | `C-Left`… select-pane (vim-aware) | Focus the pane in that direction, wrapping at the edge like tmux (Up from the top pane goes to the bottom pane in that column). While typing, passes through (word-jump). Only when a pane layout is on screen. |
+| **Alt+←/→/↑/↓** | `M-Left`… select-pane | Focus the pane in that direction (wrapping like tmux), **always**. This replaces Firefox's Alt+Left/Right Back/Forward: use Vimium `H`/`L` or the toolbar. |
 | **Ctrl+A** | prefix `C-a` | Prefix, only when **not** typing (Ctrl+A select-all still works in fields). |
 | **Ctrl+Space** | (alias) | Prefix, always (also while typing). |
 | prefix then `y` / `h` / arrows | | Split right / split down / move focus |

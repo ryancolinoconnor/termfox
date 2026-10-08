@@ -296,7 +296,7 @@ export function layoutRects(node, x = 0, y = 0, w = 100, h = 100, out = new Map(
 }
 
 /** Nearest pane in direction dir ("left"|"right"|"up"|"down") from `current`, or null. */
-export function findNeighbour(rects, current, dir) {
+export function findNeighbour(rects, current, dir, { wrap = true } = {}) {
   const cur = rects.get(current);
   if (!cur) {
     return null;
@@ -323,6 +323,40 @@ export function findNeighbour(rects, current, dir) {
     const score = gap * 1000 - overlap; // nearest first, then most-overlapping
     if (score < bestScore) {
       bestScore = score;
+      best = tab;
+    }
+  }
+  return best ?? (wrap ? wrapNeighbour(rects, current, cur, dir) : null);
+}
+
+// tmux select-pane wraps at the layout edge: Up from the top row goes to the bottom
+// row, and so on. Candidates touch the opposite edge; pick the most overlap with the
+// current pane's column (up/down) or row (left/right).
+function wrapNeighbour(rects, current, cur, dir) {
+  const eps = 0.01;
+  const all = [...rects.values()];
+  const edge = {
+    up: Math.max(...all.map(r => r.y + r.h)),
+    down: Math.min(...all.map(r => r.y)),
+    left: Math.max(...all.map(r => r.x + r.w)),
+    right: Math.min(...all.map(r => r.x)),
+  }[dir];
+  let best = null;
+  let bestOverlap = eps;
+  for (const [tab, r] of rects) {
+    if (tab === current) {
+      continue;
+    }
+    const horizontal = dir === "left" || dir === "right";
+    const side = { up: r.y + r.h, down: r.y, left: r.x + r.w, right: r.x }[dir];
+    if (Math.abs(side - edge) > eps) {
+      continue;
+    }
+    const overlap = horizontal
+      ? Math.min(cur.y + cur.h, r.y + r.h) - Math.max(cur.y, r.y)
+      : Math.min(cur.x + cur.w, r.x + r.w) - Math.max(cur.x, r.x);
+    if (overlap > bestOverlap) {
+      bestOverlap = overlap;
       best = tab;
     }
   }

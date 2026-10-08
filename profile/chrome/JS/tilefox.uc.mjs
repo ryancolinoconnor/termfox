@@ -1044,7 +1044,7 @@ class TilefoxWindow {
     }
     const best = Core.findNeighbour(this.rects(), this.gBrowser.selectedTab, dir);
     if (!best) {
-      LOG("focus", dir, "- no neighbour in that direction");
+      LOG("focus", dir, "- no other pane to move to");
       return;
     }
     LOG("focus", dir, "-> pane", this.paneTabs().indexOf(best) + 1);

@@ -196,8 +196,42 @@ test("neighbour lookup in a 3-pane layout", () => {
   assert.equal(findNeighbour(r, "B", "down"), "C");
   assert.equal(findNeighbour(r, "C", "up"), "B");
   assert.equal(findNeighbour(r, "C", "left"), "A");
-  assert.equal(findNeighbour(r, "A", "left"), null);
+  assert.equal(findNeighbour(r, "A", "left", { wrap: false }), null);
   assert.equal(findNeighbour(r, "missing", "left"), null);
+});
+
+test("findNeighbour wraps at the layout edge like tmux", () => {
+  // A | (B over C)
+  const t1 = { dir: "row", ratio: 0.5, a: { tab: "A" }, b: { dir: "col", ratio: 0.5, a: { tab: "B" }, b: { tab: "C" } } };
+  const r1 = layoutRects(t1);
+  assert.equal(findNeighbour(r1, "B", "up"), "C"); // top wraps to bottom, same column
+  assert.equal(findNeighbour(r1, "C", "down"), "B"); // bottom wraps to top
+  assert.equal(findNeighbour(r1, "B", "right"), "A"); // right edge wraps to left, same row
+  assert.equal(findNeighbour(r1, "C", "right"), "A");
+  assert.equal(findNeighbour(r1, "A", "up"), null); // A spans the column; nothing else in it
+  assert.equal(findNeighbour(r1, "A", "down"), null);
+
+  // (A over B) | C with A taller: C right wraps to whichever left pane overlaps C's row most
+  const t2 = { dir: "row", ratio: 0.5, a: { dir: "col", ratio: 0.7, a: { tab: "A" }, b: { tab: "B" } }, b: { tab: "C" } };
+  const r2 = layoutRects(t2);
+  assert.equal(findNeighbour(r2, "C", "right"), "A"); // A overlaps 70% of C's row, B 30%
+
+  // Top: wide T spanning both columns. Bottom: L (30%) | R (70%).
+  // Down from R (bottom row) wraps to T, the only pane on the top edge.
+  const t3 = { dir: "col", ratio: 0.5, a: { tab: "T" }, b: { dir: "row", ratio: 0.3, a: { tab: "L" }, b: { tab: "R" } } };
+  const r3 = layoutRects(t3);
+  assert.equal(findNeighbour(r3, "R", "down"), "T");
+  assert.equal(findNeighbour(r3, "T", "up"), "R"); // T wraps to the bottom pane overlapping its column most (R 70% > L 30%)
+  assert.equal(findNeighbour(r3, "L", "left"), "R"); // left edge wraps to right, same row
+
+  // 3 rows: up from the top pane goes to the bottom one, not the middle
+  const t4 = { dir: "col", ratio: 0.33, a: { tab: "X" }, b: { dir: "col", ratio: 0.5, a: { tab: "Y" }, b: { tab: "Z" } } };
+  const r4 = layoutRects(t4);
+  assert.equal(findNeighbour(r4, "X", "up"), "Z");
+  assert.equal(findNeighbour(r4, "Z", "down"), "X");
+
+  // single pane: no wrap target
+  assert.equal(findNeighbour(layoutRects({ tab: "S" }), "S", "up"), null);
 });
 
 test("fuzzy", () => {
