@@ -1,0 +1,121 @@
+/* ==UserScript==
+// @name           tilefox styles
+// @description    Pane layout, focused-pane outline and palette for tilefox.uc.mjs
+// ==/UserScript== */
+
+/*
+ * Loaded by fx-autoconfig as an author sheet on browser.xhtml through a chrome:// URL
+ * (https://github.com/MrOtherGuy/fx-autoconfig#styles). A chrome:// sheet in a chrome document
+ * may use chrome-only properties such as -moz-subtree-hidden-only-visually.
+ *
+ * #tabbrowser-tabpanels is a grid where every panel sits in grid-area 1/1 and non-selected
+ * panels are hidden with -moz-subtree-hidden-only-visually: 1:
+ *   https://searchfox.org/mozilla-central/source/toolkit/content/xul.css  (deck, tabpanels & stack)
+ * The [tilefox] attribute is present only while the selected tab is one of the panes.
+ */
+
+#tabbrowser-tabpanels[tilefox] > .tilefox-pane {
+  -moz-subtree-hidden-only-visually: 0 !important;
+  visibility: inherit !important;
+  display: flex !important;
+  position: absolute !important;
+  left: var(--tf-left) !important;
+  top: var(--tf-top) !important;
+  width: var(--tf-width) !important;
+  height: var(--tf-height) !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  margin: 0 !important;
+  box-sizing: border-box !important;
+  padding: 2px !important;
+  background: var(--toolbar-bgcolor, #2b2a33);
+  overflow: clip;
+  z-index: 0;
+}
+
+/* Focused pane = the selected tab's panel. The padding above shows as a coloured frame. */
+#tabbrowser-tabpanels[tilefox] > .tilefox-pane.deck-selected {
+  background: var(--tilefox-accent, #00b3f4) !important;
+  z-index: 1;
+}
+
+#tabbrowser-tabpanels[tilefox] > .tilefox-pane > .browserContainer {
+  flex: 1 !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+}
+
+/* DOM fullscreen (Netflix, YouTube): only the selected pane, full size. */
+:root[inDOMFullscreen] #tabbrowser-tabpanels[tilefox] > .tilefox-pane:not(.deck-selected) {
+  display: none !important;
+}
+:root[inDOMFullscreen] #tabbrowser-tabpanels[tilefox] > .tilefox-pane.deck-selected {
+  inset: 0 !important;
+  width: auto !important;
+  height: auto !important;
+  padding: 0 !important;
+}
+
+/* ---- prefix hint + palette ---- */
+#tilefox-panel {
+  --panel-padding: 0;
+  appearance: none;
+  background: transparent;
+  border: none;
+}
+#tilefox-panel .tilefox-box {
+  width: 560px;
+  background: #1c1b22;
+  color: #fbfbfe;
+  border: 1px solid #00b3f4;
+  border-radius: 8px;
+  padding: 8px;
+  font: menu;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+#tilefox-panel[mode="prefix"] .tilefox-box {
+  width: 640px;
+}
+#tilefox-panel .tilefox-hint {
+  font-size: 12px;
+  opacity: 0.8;
+  padding: 2px 4px 6px;
+}
+#tilefox-panel .tilefox-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 6px 8px;
+  border-radius: 4px;
+  border: 1px solid #52525e;
+  background: #2b2a33;
+  color: inherit;
+}
+/* In prefix mode the input only exists to hold keyboard focus. */
+#tilefox-panel[mode="prefix"] .tilefox-input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+}
+#tilefox-panel[mode="prefix"] .tilefox-list {
+  display: none;
+}
+#tilefox-panel .tilefox-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  max-height: 360px;
+  overflow-y: auto;
+}
+#tilefox-panel .tilefox-list > li {
+  padding: 4px 8px;
+  border-radius: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+#tilefox-panel .tilefox-list > li[selected] {
+  background: #00b3f4;
+  color: #000;
+}
