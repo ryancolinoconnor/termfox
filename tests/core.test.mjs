@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import {
   parseCombo, comboToString, comboMatches, comboToHotkey, comboToOriginalKey, resolveKeyMap,
   bindingFor, actionFor, routeChromeKey, routeContentKey, prefixActionFor, keyPref, KEYMAP,
-  layoutRects, findNeighbour, fuzzy, isEditable, installPaintHook, createFileLogger,
+  layoutRects, findNeighbour, fuzzy, isEditable, isEmptyEditable, installPaintHook, createFileLogger,
   WindowSet, serializeLayout, deserializeLayout, autoWindowName, parseTabValue, PREFIX_KEYS,
   PressLedger, routeChromeKey as routeChrome,
   formatError, formatLine, sanitizeLogText, redactText, validateActorMessage, routeActorMessage, RateLimiter,
@@ -271,6 +271,66 @@ test("isEditable", () => {
   assert.ok(isEditable(el("div", { role: "textbox" })));
   assert.ok(!isEditable(el("div")));
   assert.ok(isEditable(null, { designMode: "on" }));
+});
+
+// ---- empty editables don't count as typing (chatgpt.com's autofocused prompt box)
+
+const ce = (textContent, embeds = false) => ({
+  localName: "div", isContentEditable: true, textContent, getAttribute: () => null,
+  querySelector: () => (embeds ? {} : null),
+});
+const inp = (type, value) => ({ localName: "input", value, getAttribute: n => (n === "type" ? type : null) });
+
+test("isEmptyEditable: empty contenteditable, <p><br></p> placeholder, text, password", () => {
+  assert.equal(isEmptyEditable(ce("")), true); // empty contenteditable
+  assert.equal(isEmptyEditable(ce("  \n​")), true); // whitespace / zero-width caret placeholder
+  assert.equal(isEmptyEditable(ce("")), true, "<p><br></p> has textContent ''"); // ProseMirror placeholder
+  assert.equal(isEmptyEditable(ce("hello")), false); // non-empty text
+  assert.equal(isEmptyEditable(ce("", true)), false); // only a pasted image: not empty
+  assert.equal(isEmptyEditable(inp("text", "")), true);
+  assert.equal(isEmptyEditable(inp("text", "   ")), true);
+  assert.equal(isEmptyEditable(inp("text", "q")), false);
+  assert.equal(isEmptyEditable(inp("password", "")), false); // password: always typing
+  assert.equal(isEmptyEditable(inp("PASSWORD", "")), false);
+  assert.equal(isEmptyEditable({ localName: "textarea", value: "", getAttribute: () => null }), true);
+  assert.equal(isEmptyEditable({ localName: "textarea", value: "x", getAttribute: () => null }), false);
+  assert.equal(isEmptyEditable(ce(""), { designMode: "on" }), false); // conservative
+  assert.equal(isEmptyEditable({ localName: "select", getAttribute: () => null }), false);
+  assert.equal(isEmptyEditable({ localName: "div", getAttribute: () => "textbox" }), false); // ARIA-only
+  assert.equal(isEmptyEditable(null), false);
+  const throws = { localName: "div", isContentEditable: true, get textContent() { throw new Error("x"); } };
+  assert.equal(isEmptyEditable(throws), false); // errors mean "not empty"
+  // Returns a boolean only: the field's text never leaves the function.
+  assert.equal(typeof isEmptyEditable(ce("secret")), "boolean");
+});
+
+test("real DOM shapes: <p><br></p> placeholder is empty, text is not", () => {
+  // Minimal DOM: textContent concatenates text nodes, <br> contributes nothing.
+  const node = (localName, children = [], text = "") => ({
+    localName, children, text,
+    get textContent() { return this.text + this.children.map(c => c.textContent).join(""); },
+  });
+  const host = kids => Object.assign(node("div", kids), {
+    isContentEditable: true, getAttribute: () => null,
+    querySelector(sel) {
+      const want = new Set(sel.split(","));
+      const walk = n => n.children.find(c => want.has(c.localName) || walk(c));
+      return walk(this) || null;
+    },
+  });
+  assert.equal(isEmptyEditable(host([node("p", [node("br")])])), true);
+  assert.equal(isEmptyEditable(host([node("br")])), true);
+  assert.equal(isEmptyEditable(host([node("p", [], "hi")])), false);
+  assert.equal(isEmptyEditable(host([node("p", [node("img")])])), false);
+});
+
+test("empty editable: Ctrl+A / Ctrl+H / Ctrl+Y / Ctrl+Arrow act; non-empty passes", () => {
+  for (const x of [b("a", ctrl), b("h", ctrl), b("y", ctrl), b("ArrowLeft", ctrl, "ArrowLeft")]) {
+    assert.equal(v(routeContentKey(x, { editable: true, fieldEmpty: true, isPane: true })), "take", x.id);
+    assert.equal(v(routeContentKey(x, { editable: true, fieldEmpty: false, isPane: true })), "pass", x.id);
+  }
+  // Word-jump in an empty field outside a pane still passes (not a pane).
+  assert.equal(v(routeContentKey(b("ArrowLeft", ctrl, "ArrowLeft"), { editable: true, fieldEmpty: true, isPane: false })), "pass");
 });
 
 // ---- background painting: Firefox 157.0.1 / 158 / fallbacks

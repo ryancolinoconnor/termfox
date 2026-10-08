@@ -6,7 +6,9 @@
  * actor makes the decision where the focus actually lives (trusted events only, nothing while paused):
  *   - a "pass when typing" key (Ctrl+Y, Ctrl+H, Ctrl+A, Ctrl+Arrow; see KEYMAP in
  *     TermfoxCore) in an editable element -> do nothing, the page/field gets it (word-jump,
- *     select-all, redo...). Like tmux's vim-aware `send-keys`.
+ *     select-all, redo...). Like tmux's vim-aware `send-keys`. An EMPTY editable (an
+ *     autofocused prompt box) doesn't count as typing, like the chrome URL bar; password
+ *     fields always count as typing.
  *   - the same key elsewhere -> eat it and ask the parent to run the action
  *     (Ctrl+Arrow only when this tab is a termfox pane)
  *   - "always" keys (Alt+Y/H, Alt+Arrow, Ctrl+Space...) -> fallback only. The chrome window's
@@ -21,7 +23,7 @@
  *   https://searchfox.org/mozilla-central/source/dom/ipc/SharedMap.h
  */
 
-import { bindingFor, isEditable, resolveKeyMap, routeContentKey } from "./TermfoxCore.sys.mjs";
+import { bindingFor, isEditable, isEmptyEditable, resolveKeyMap, routeContentKey } from "./TermfoxCore.sys.mjs";
 
 export { isEditable };
 
@@ -90,7 +92,10 @@ export class TermfoxChild extends JSWindowActorChild {
     const doc = this.document;
     const el = deepActiveElement(doc);
     const isPane = !!(panes && browserId && panes.includes(browserId));
-    const { verdict } = routeContentKey(b, { editable: isEditable(el, doc), isPane });
+    const editable = isEditable(el, doc);
+    // Booleans only: the field's text never leaves isEmptyEditable.
+    const fieldEmpty = editable && isEmptyEditable(el, doc);
+    const { verdict } = routeContentKey(b, { editable, fieldEmpty, isPane });
     if (verdict === "pass") {
       this.logEvent(b.action.startsWith("focus-") && !isPane ? "pass-not-pane" : "pass-typing", b.action);
       return;

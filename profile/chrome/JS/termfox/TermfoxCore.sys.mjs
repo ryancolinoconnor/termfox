@@ -372,7 +372,8 @@ export function routeChromeKey(b, ctx) {
 }
 
 /**
- * Content-actor decision for a matched binding. ctx: {editable, isPane}.
+ * Content-actor decision for a matched binding. ctx: {editable, fieldEmpty, isPane}.
+ *   fieldEmpty  the editable field holds no text (isEmptyEditable): same rule as the chrome URL bar.
  * "take" bindings normally never reach content (chrome took them); here they are a fallback.
  */
 export function routeContentKey(b, ctx) {
@@ -382,8 +383,13 @@ export function routeContentKey(b, ctx) {
   if (isFocusAction(b.action) && !ctx.isPane) {
     return { verdict: "pass", why: "this tab is not a pane" };
   }
-  if (ctx.editable) {
+  if (ctx.editable && !ctx.fieldEmpty) {
     return { verdict: "pass", why: "typing in an editable field" };
+  }
+  if (ctx.editable) {
+    // Autofocused prompt boxes (chatgpt.com) would otherwise swallow the prefix forever. An empty
+    // field has nothing to select, redo or word-jump over.
+    return { verdict: "take", why: "editable field is empty" };
   }
   return { verdict: "take", why: "not typing" };
 }
@@ -991,6 +997,44 @@ export function isEditable(el, doc) {
     return true;
   }
   return false;
+}
+
+// Whitespace plus zero-width characters some editors use as caret placeholders.
+const NON_BLANK = /[^\s​‌‍⁠﻿]/;
+// Content with no text that still counts as "something there" (a pasted image, an embed...).
+const NON_TEXT_CONTENT = "img,picture,video,audio,iframe,object,embed,canvas,svg,input,textarea,select";
+
+/**
+ * True only when an editable `el` (isEditable already true) clearly holds no text, so a
+ * pass-when-typing key can act as a termfox key there. Returns a boolean only: the field's
+ * text is tested in place and never stored, returned, logged or sent (security audit M1).
+ * Conservative: password fields, designMode documents, <select> and ARIA-only widgets are
+ * never "empty"; any error means "not empty".
+ */
+export function isEmptyEditable(el, doc) {
+  try {
+    if (!el || (doc && doc.designMode === "on")) {
+      return false;
+    }
+    const tag = el.localName;
+    if (tag === "input") {
+      if ((el.getAttribute("type") || "").toLowerCase() === "password") {
+        return false;
+      }
+      return typeof el.value === "string" && !NON_BLANK.test(el.value);
+    }
+    if (tag === "textarea") {
+      return typeof el.value === "string" && !NON_BLANK.test(el.value);
+    }
+    if (el.isContentEditable) {
+      // Lone <br> / <p><br></p> placeholders (ProseMirror, Lexical, Draft) have no textContent.
+      return typeof el.textContent === "string" && !NON_BLANK.test(el.textContent) &&
+        !el.querySelector?.(NON_TEXT_CONTENT);
+    }
+    return false;
+  } catch (e) {
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------- file log
