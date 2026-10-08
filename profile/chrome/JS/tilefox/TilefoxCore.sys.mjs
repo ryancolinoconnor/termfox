@@ -331,7 +331,7 @@ export function findNeighbour(rects, current, dir, { wrap = true } = {}) {
 
 // tmux select-pane wraps at the layout edge: Up from the top row goes to the bottom
 // row, and so on. Candidates touch the opposite edge; pick the most overlap with the
-// current pane's column (up/down) or row (left/right).
+// current pane's column (up/down) or row (left/right), ties to the leftmost/topmost.
 function wrapNeighbour(rects, current, cur, dir) {
   const eps = 0.01;
   const all = [...rects.values()];
@@ -343,6 +343,7 @@ function wrapNeighbour(rects, current, cur, dir) {
   }[dir];
   let best = null;
   let bestOverlap = eps;
+  let bestPos = Infinity;
   for (const [tab, r] of rects) {
     if (tab === current) {
       continue;
@@ -355,8 +356,15 @@ function wrapNeighbour(rects, current, cur, dir) {
     const overlap = horizontal
       ? Math.min(cur.y + cur.h, r.y + r.h) - Math.max(cur.y, r.y)
       : Math.min(cur.x + cur.w, r.x + r.w) - Math.max(cur.x, r.x);
-    if (overlap > bestOverlap) {
+    // Ties (equal overlap) go to the leftmost pane when wrapping up/down, the topmost
+    // when wrapping left/right (Ryan, 2026-10-08: "Ctrl+Up at the top should go to the bottom... on the left").
+    const pos = horizontal ? r.y : r.x;
+    if (overlap <= eps) {
+      continue;
+    }
+    if (overlap > bestOverlap + eps || (Math.abs(overlap - bestOverlap) <= eps && pos < bestPos)) {
       bestOverlap = overlap;
+      bestPos = pos;
       best = tab;
     }
   }

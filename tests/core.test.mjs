@@ -200,6 +200,25 @@ test("neighbour lookup in a 3-pane layout", () => {
   assert.equal(findNeighbour(r, "missing", "left"), null);
 });
 
+test("wrap ties go leftmost (up/down) and topmost (left/right)", () => {
+  // Full-width top pane T over a bottom row split evenly: L | R. Ctrl+Up from T -> bottom-left.
+  const t = { dir: "col", ratio: 0.5, a: { tab: "T" }, b: { dir: "row", ratio: 0.5, a: { tab: "L" }, b: { tab: "R" } } };
+  const r = layoutRects(t);
+  assert.equal(findNeighbour(r, "T", "up"), "L");
+  // Same with R listed first in the map, so the pick doesn't depend on order
+  const rev = new Map([...r].reverse());
+  assert.equal(findNeighbour(rev, "T", "up"), "L");
+  // Mirror: bottom-full B under a top row L | R; Ctrl+Down from B -> top-left
+  const t2 = { dir: "col", ratio: 0.5, a: { dir: "row", ratio: 0.5, a: { tab: "L" }, b: { tab: "R" } }, b: { tab: "B" } };
+  assert.equal(findNeighbour(new Map([...layoutRects(t2)].reverse()), "B", "down"), "L");
+  // Full-height left pane F beside a right column U over D: Ctrl+Left from F -> top-right (U)
+  const t3 = { dir: "row", ratio: 0.5, a: { tab: "F" }, b: { dir: "col", ratio: 0.5, a: { tab: "U" }, b: { tab: "D" } } };
+  assert.equal(findNeighbour(new Map([...layoutRects(t3)].reverse()), "F", "left"), "U");
+  // Clear overlap winner still beats the tie-break: L 30% | R 70% under T -> R
+  const t4 = { dir: "col", ratio: 0.5, a: { tab: "T" }, b: { dir: "row", ratio: 0.3, a: { tab: "L" }, b: { tab: "R" } } };
+  assert.equal(findNeighbour(layoutRects(t4), "T", "up"), "R");
+});
+
 test("findNeighbour wraps at the layout edge like tmux", () => {
   // A | (B over C)
   const t1 = { dir: "row", ratio: 0.5, a: { tab: "A" }, b: { dir: "col", ratio: 0.5, a: { tab: "B" }, b: { tab: "C" } } };
