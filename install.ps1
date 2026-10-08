@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  tilefox day-1 spike installer (Windows, Firefox Release).
+  termfox day-1 spike installer (Windows, Firefox Release).
 
 .DESCRIPTION
   1. Finds your Firefox Release install folder.
@@ -8,15 +8,15 @@
   3. Asks for admin (UAC) ONLY to copy two files into the Firefox program folder:
        <Firefox>\config.js
        <Firefox>\defaults\pref\config-prefs.js
-  4. Creates a NEW profile "tilefox-spike" (firefox.exe -CreateProfile) and puts the
-     loader files + tilefox scripts in that profile's chrome\ folder.
+  4. Creates a NEW profile "termfox" (firefox.exe -CreateProfile) and puts the
+     loader files + termfox scripts in that profile's chrome\ folder.
   5. Writes a manifest so uninstall.ps1 removes exactly what was added.
 
   It never touches any other profile. Close ALL Firefox windows first.
 
   Note: the two program-folder files are read by every profile of this Firefox install,
   but config.js does nothing unless a profile has chrome\utils\chrome.manifest, which
-  only the tilefox-spike profile has.
+  only the termfox profile has.
   fx-autoconfig: https://github.com/MrOtherGuy/fx-autoconfig#install
 
 .EXAMPLE
@@ -25,7 +25,7 @@
 [CmdletBinding()]
 param(
     [string]$FirefoxDir = "",
-    [string]$ProfileName = "tilefox-spike",
+    [string]$ProfileName = "termfox",
     [switch]$Force,
     # Internal: used by the elevated child process. Do not pass by hand.
     [switch]$ElevatedProgramCopy,
@@ -53,8 +53,10 @@ $ProfileLoaderFiles = @(
 )
 
 $ScriptRoot  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ManifestDir = Join-Path $env:LOCALAPPDATA "tilefox"
+$ManifestDir = Join-Path $env:LOCALAPPDATA "termfox"
 $ManifestPath = Join-Path $ManifestDir "install-manifest.json"
+# Installs made before the rename (2026-10-08) kept their manifest here (profile "tilefox-spike").
+$LegacyManifestPath = Join-Path $env:LOCALAPPDATA "tilefox\install-manifest.json"
 
 function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Wrote([string]$path) { Write-Host "    wrote  $path" -ForegroundColor Green }
@@ -103,7 +105,7 @@ if ($ElevatedProgramCopy) {
 
 # ================================================================ main (runs as you)
 Write-Host ""
-Write-Host "tilefox spike installer" -ForegroundColor White
+Write-Host "termfox spike installer" -ForegroundColor White
 Write-Host "  fx-autoconfig pinned at $FxacCommit"
 Write-Host ""
 
@@ -112,8 +114,10 @@ if (Test-IsAdmin) {
     Write-Host "         elevated user ($env:USERNAME). Prefer a normal PowerShell window." -ForegroundColor Yellow
 }
 
-if (Test-Path -LiteralPath $ManifestPath) {
-    Fail "Already installed (manifest at $ManifestPath). Run uninstall.ps1 first, or see README 'Updating the scripts'."
+foreach ($mp in @($ManifestPath, $LegacyManifestPath)) {
+    if (Test-Path -LiteralPath $mp) {
+        Fail "Already installed (manifest at $mp). Run uninstall.ps1 first, or see README 'Updating the scripts'."
+    }
 }
 
 # ---------------------------------------------------------------- Firefox must be closed
@@ -179,7 +183,7 @@ Get-ChildItem -LiteralPath (Join-Path $FirefoxDir "defaults\pref") -Filter *.js 
 # ---------------------------------------------------------------- download + verify
 Write-Step "Downloading fx-autoconfig ($FxacCommit) and checking SHA-256"
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-$Staging = Join-Path $env:TEMP ("tilefox-install-" + [guid]::NewGuid().ToString("N"))
+$Staging = Join-Path $env:TEMP ("termfox-install-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $Staging | Out-Null
 foreach ($f in ($ProgramFiles + $ProfileLoaderFiles)) {
     $out = Join-Path $Staging $f.Dst
@@ -193,8 +197,8 @@ foreach ($f in ($ProgramFiles + $ProfileLoaderFiles)) {
 
 # Our own scripts ship next to this installer.
 $OurChrome = Join-Path $ScriptRoot "profile\chrome"
-foreach ($p in @("JS\tilefox.uc.mjs", "JS\tilefox_actor.sys.mjs", "JS\tilefox\TilefoxChild.sys.mjs", "JS\tilefox\TilefoxParent.sys.mjs", "CSS\tilefox.uc.css")) {
-    if (-not (Test-Path -LiteralPath (Join-Path $OurChrome $p))) { Fail "Missing $OurChrome\$p (run install.ps1 from the tilefox-spike folder)." }
+foreach ($p in @("JS\termfox.uc.mjs", "JS\termfox_actor.sys.mjs", "JS\termfox\TermfoxChild.sys.mjs", "JS\termfox\TermfoxParent.sys.mjs", "CSS\termfox.uc.css")) {
+    if (-not (Test-Path -LiteralPath (Join-Path $OurChrome $p))) { Fail "Missing $OurChrome\$p (run install.ps1 from the termfox folder)." }
 }
 
 # ---------------------------------------------------------------- profile path checks (before any write)
@@ -228,7 +232,7 @@ if (-not $elev.ok) { Fail "Admin step failed: $($elev.error). Files listed above
 # Manifest is written as soon as anything exists, so uninstall can always clean up.
 New-Item -ItemType Directory -Path $ManifestDir -Force | Out-Null
 $manifest = [ordered]@{
-    tool = "tilefox-spike"; installedAt = (Get-Date).ToString("s"); fxacCommit = $FxacCommit
+    tool = "termfox"; installedAt = (Get-Date).ToString("s"); fxacCommit = $FxacCommit
     firefoxDir = $FirefoxDir; firefoxVersion = $version
     programFiles = @($elev.files); profileName = $ProfileName; profileDir = $ProfileDir
     profileLocalDir = (Join-Path $env:LOCALAPPDATA "Mozilla\Firefox\Profiles\$ProfileName")
@@ -256,7 +260,7 @@ Save-Manifest
 Write-Wrote "$ProfileDir  (new profile; registered in $ProfilesIni)"
 
 # ---------------------------------------------------------------- profile files
-Write-Step "Copying loader + tilefox scripts into the new profile only"
+Write-Step "Copying loader + termfox scripts into the new profile only"
 $profileFiles = @()
 foreach ($f in $ProfileLoaderFiles) {
     $dst = Join-Path $ProfileDir $f.Dst
@@ -274,8 +278,8 @@ Get-ChildItem -LiteralPath $OurChrome -Recurse -File | ForEach-Object {
 # user.js applies only to this profile.
 $userJs = Join-Path $ProfileDir "user.js"
 @(
-    '// tilefox spike profile prefs (this profile only)',
-    'user_pref("tilefox.enabled", true);',
+    '// termfox spike profile prefs (this profile only)',
+    'user_pref("termfox.enabled", true);',
     '// Lets the Browser Console (Ctrl+Shift+J) evaluate chrome JS while debugging the spike.',
     'user_pref("devtools.chrome.enabled", true);'
     # DRM prefs deliberately left at Firefox defaults so the DRM test is honest.
@@ -289,6 +293,6 @@ Remove-Item -LiteralPath $Staging -Recurse -Force
 Write-Host ""
 Write-Host "Installed. Start the spike profile with:" -ForegroundColor White
 Write-Host "  & `"$FirefoxExe`" -P $ProfileName -no-remote"
-Write-Host "or double-click launch-tilefox.cmd in this folder."
+Write-Host "or double-click launch-termfox.cmd in this folder."
 Write-Host "Your normal Firefox profile is unchanged and still opens as usual."
 exit 0

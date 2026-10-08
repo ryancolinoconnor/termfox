@@ -1,6 +1,6 @@
 /* ==UserScript==
-// @name           tilefox styles
-// @description    Pane layout, focused-pane outline and palette for tilefox.uc.mjs
+// @name           termfox styles
+// @description    Pane layout, focused-pane outline and palette for termfox.uc.mjs
 // ==/UserScript== */
 
 /*
@@ -11,10 +11,10 @@
  * #tabbrowser-tabpanels is a grid where every panel sits in grid-area 1/1 and non-selected
  * panels are hidden with -moz-subtree-hidden-only-visually: 1:
  *   https://searchfox.org/mozilla-central/source/toolkit/content/xul.css  (deck, tabpanels & stack)
- * The [tilefox] attribute is present only while the selected tab is one of the panes.
+ * The [termfox] attribute is present only while the selected tab is one of the panes.
  */
 
-#tabbrowser-tabpanels[tilefox] > .tilefox-pane {
+#tabbrowser-tabpanels[termfox] > .termfox-pane {
   -moz-subtree-hidden-only-visually: 0 !important;
   visibility: inherit !important;
   display: flex !important;
@@ -34,22 +34,22 @@
 }
 
 /* Focused pane = the selected tab's panel. The padding above shows as a coloured frame. */
-#tabbrowser-tabpanels[tilefox] > .tilefox-pane.deck-selected {
-  background: var(--tilefox-accent, #00b3f4) !important;
+#tabbrowser-tabpanels[termfox] > .termfox-pane.deck-selected {
+  background: var(--termfox-accent, #00b3f4) !important;
   z-index: 1;
 }
 
-#tabbrowser-tabpanels[tilefox] > .tilefox-pane > .browserContainer {
+#tabbrowser-tabpanels[termfox] > .termfox-pane > .browserContainer {
   flex: 1 !important;
   min-width: 0 !important;
   min-height: 0 !important;
 }
 
 /* DOM fullscreen (Netflix, YouTube): only the selected pane, full size. */
-:root[inDOMFullscreen] #tabbrowser-tabpanels[tilefox] > .tilefox-pane:not(.deck-selected) {
+:root[inDOMFullscreen] #tabbrowser-tabpanels[termfox] > .termfox-pane:not(.deck-selected) {
   display: none !important;
 }
-:root[inDOMFullscreen] #tabbrowser-tabpanels[tilefox] > .tilefox-pane.deck-selected {
+:root[inDOMFullscreen] #tabbrowser-tabpanels[termfox] > .termfox-pane.deck-selected {
   inset: 0 !important;
   width: auto !important;
   height: auto !important;
@@ -57,15 +57,15 @@
 }
 
 /* ---- prefix hint + palette + reload toast ---- */
-#tilefox-panel,
-#tilefox-toast {
+#termfox-panel,
+#termfox-toast {
   --panel-padding: 0;
   appearance: none;
   background: transparent;
   border: none;
 }
-#tilefox-panel .tilefox-box,
-#tilefox-toast .tilefox-box {
+#termfox-panel .termfox-box,
+#termfox-toast .termfox-box {
   width: 560px;
   background: #1c1b22;
   color: #fbfbfe;
@@ -75,19 +75,19 @@
   font: menu;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
-#tilefox-toast .tilefox-box {
+#termfox-toast .termfox-box {
   width: 320px;
   text-align: center;
 }
-#tilefox-panel[mode="prefix"] .tilefox-box {
+#termfox-panel[mode="prefix"] .termfox-box {
   width: 760px;
 }
-#tilefox-panel .tilefox-hint {
+#termfox-panel .termfox-hint {
   font-size: 12px;
   opacity: 0.8;
   padding: 2px 4px 6px;
 }
-#tilefox-panel .tilefox-input {
+#termfox-panel .termfox-input {
   width: 100%;
   box-sizing: border-box;
   padding: 6px 8px;
@@ -97,23 +97,23 @@
   color: inherit;
 }
 /* In prefix / confirm mode the input only exists to hold keyboard focus. */
-#tilefox-panel:is([mode="prefix"], [mode="confirm"]) .tilefox-input {
+#termfox-panel:is([mode="prefix"], [mode="confirm"]) .termfox-input {
   position: absolute;
   opacity: 0;
   width: 1px;
   height: 1px;
 }
-#tilefox-panel:is([mode="prefix"], [mode="confirm"], [mode="rename"]) .tilefox-list {
+#termfox-panel:is([mode="prefix"], [mode="confirm"], [mode="rename"]) .termfox-list {
   display: none;
 }
-#tilefox-panel .tilefox-list {
+#termfox-panel .termfox-list {
   list-style: none;
   margin: 6px 0 0;
   padding: 0;
   max-height: 360px;
   overflow-y: auto;
 }
-#tilefox-panel .tilefox-list > li {
+#termfox-panel .termfox-list > li {
   padding: 4px 8px;
   border-radius: 4px;
   white-space: nowrap;
@@ -121,13 +121,13 @@
   text-overflow: ellipsis;
   cursor: pointer;
 }
-#tilefox-panel .tilefox-list > li[selected] {
+#termfox-panel .termfox-list > li[selected] {
   background: #00b3f4;
   color: #000;
 }
 
-/* ---- tmux-style status line: "0:mail  1:dev*  2:docs-" (pref tilefox.statusbar) ---- */
-#tilefox-status {
+/* ---- tmux-style status line: "0:mail  1:dev*  2:docs-" (pref termfox.statusbar) ---- */
+#termfox-status {
   display: flex;
   gap: 14px;
   padding: 1px 8px;
@@ -137,18 +137,18 @@
   border-top: 1px solid #00b3f4;
   user-select: none;
 }
-#tilefox-status[hidden] {
+#termfox-status[hidden] {
   display: none;
 }
-#tilefox-status > .tilefox-win {
+#termfox-status > .termfox-win {
   cursor: pointer;
   white-space: nowrap;
 }
-#tilefox-status > .tilefox-win.current {
+#termfox-status > .termfox-win.current {
   color: #000;
   background: #00b3f4;
   padding: 0 4px;
 }
-:root[inDOMFullscreen] #tilefox-status {
+:root[inDOMFullscreen] #termfox-status {
   display: none;
 }

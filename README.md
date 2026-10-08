@@ -1,4 +1,4 @@
-# tilefox (day-1 spike)
+# termfox (day-1 spike)
 
 tmux/i3-style panes inside **official Firefox Release** on Windows. This is not a fork: it adds privileged
 "chrome" scripts through [fx-autoconfig](https://github.com/MrOtherGuy/fx-autoconfig), so you keep
@@ -13,7 +13,7 @@ The default keymap **mirrors your `~/.tmux.conf`** (spec: [KEYMAP-SPEC.md](KEYMA
 a key twice, the last binding wins). tmux's "vim-aware" keys become "typing-aware": when the focus is in a text
 field, editor, URL bar, select or similar, the key goes to the page instead, just as tmux sends it on to vim.
 
-| Key | tmux.conf | tilefox |
+| Key | tmux.conf | termfox |
 |---|---|---|
 | **Ctrl+Y** | `C-y` split-window -h (vim-aware) | New pane to the **right**. While typing, passes through (Ctrl+Y = redo there). |
 | **Ctrl+H** | `C-h` split-window -v (vim-aware) | New pane **below**. While typing, passes through. An *empty* text field (such as the URL bar of a fresh pane) doesn't count as typing, so Ctrl+H twice makes three panes. |
@@ -28,8 +28,8 @@ field, editor, URL bar, select or similar, the key goes to the page instead, jus
 | prefix then `f` / `x` | `f` find-window | Palette / unpane (turn the focused pane back into a normal tab). Esc cancels. (`p` is now previous-window, as in tmux.) |
 | prefix then `c` `n` `p` `l` `0`–`9` `,` `w` `&` | tmux defaults | **Windows** (below): new, next, previous, last, select by index, rename, list, kill. |
 | **Alt+L** / **Alt+0…9** | | Last window / select window N, no prefix. |
-| **Ctrl+Shift+P** | | Fuzzy palette over tilefox windows (`window:name`), panes (▣) and tabs in all windows. Replaces "New private window" (use the menu). |
-| **Ctrl+Alt+Shift+K** | | Kill switch: toggles `tilefox.enabled`. Off means panes dissolve and Firefox's keys come back. |
+| **Ctrl+Shift+P** | | Fuzzy palette over termfox windows (`window:name`), panes (▣) and tabs in all windows. Replaces "New private window" (use the menu). |
+| **Ctrl+Alt+Shift+K** | | Kill switch: toggles `termfox.enabled`. Off means panes dissolve and Firefox's keys come back. |
 | mouse | `mouse on` | Click a pane to focus it. |
 
 - Every pane is a **real tab**, so extensions, Vimium, logins and DRM work in it as usual. Closing a pane's
@@ -39,26 +39,26 @@ field, editor, URL bar, select or similar, the key goes to the page instead, jus
 
 ### Windows (tmux windows)
 
-Each tilefox window is a named group of tabs with its own pane layout, like a tmux window in a session.
+Each termfox window is a named group of tabs with its own pane layout, like a tmux window in a session.
 Switching windows hides the other windows' tabs with `gBrowser.hideTab()` and shows this window's tabs with
 `gBrowser.showTab()`, then reselects the tab you were on, so the layout comes back exactly and nothing
 reloads. (Firefox 157's native tab groups weren't used: a collapsed group still shows in the tab strip and can't
 hold a layout.) A status line under the toolbars reads `0:mail  1:dev*  2:docs-` (`*` current, `-` last);
-click an entry to switch, or set `tilefox.statusbar` = false to hide it.
+click an entry to switch, or set `termfox.statusbar` = false to hide it.
 
 - New tabs (links, Ctrl+T, splits) join the current window. Closing a window's last tab kills that window and
   goes to the last one, like tmux.
 - Pinned tabs can't be hidden, so they show in every window.
-- Windows persist across restarts in SessionStore (`setCustomWindowValue` "tilefox-windows" for names, indices
-  and layouts; `setCustomTabValue` "tilefox-tab" for each tab's window). Reopening a closed tab puts it back in
+- Windows persist across restarts in SessionStore (`setCustomWindowValue` "termfox-windows" for names, indices
+  and layouts; `setCustomTabValue` "termfox-tab" for each tab's window). Reopening a closed tab puts it back in
   its old window.
-- Every Firefox window (Ctrl+N) has its own set of tilefox windows and its own status line.
-- The kill switch shows every tab; turning tilefox back on hides the other windows again.
+- Every Firefox window (Ctrl+N) has its own set of termfox windows and its own status line.
+- The kill switch shows every tab; turning termfox back on hides the other windows again.
 
 ### Changing keys
 
-The table lives in one place (`KEYMAP` in `TilefoxCore.sys.mjs`). Override any entry with a string pref in
-`about:config`, `tilefox.keys.<id>`, for example `tilefox.keys.splitRight` = `Ctrl+H`, or `none` to unbind it.
+The table lives in one place (`KEYMAP` in `TermfoxCore.sys.mjs`). Override any entry with a string pref in
+`about:config`, `termfox.keys.<id>`, for example `termfox.keys.splitRight` = `Ctrl+H`, or `none` to unbind it.
 Ids: `splitRight`, `splitDown`, `splitRightAlways`, `splitDownAlways`, `focusLeft|Right|Up|Down`,
 `focusLeftAlways|RightAlways|UpAlways|DownAlways`, `prefix`, `prefixAlways`, `palette`, `kill`, `lastWindow`,
 `selectWindow0` … `selectWindow9`. The keydown listener
@@ -67,10 +67,10 @@ keys to follow. Bad values fall back to the default and are logged.
 
 ## Debug log
 
-Every `[tilefox]` line (plus caught errors with stacks) is also appended to
-`%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\tilefox.log` (rotates to `tilefox.log.1` at 1 MB).
-The Browser Console prints `[tilefox] file log: <path>` at startup. If a write fails, the console shows
-`[tilefox] CANNOT WRITE LOG FILE <path>` with the error, and the window shows a notification bar once.
+Every `[termfox]` line (plus caught errors with stacks) is also appended to
+`%APPDATA%\Mozilla\Firefox\Profiles\termfox\termfox.log` (rotates to `termfox.log.1` at 1 MB).
+The Browser Console prints `[termfox] file log: <path>` at startup. If a write fails, the console shows
+`[termfox] CANNOT WRITE LOG FILE <path>` with the error, and the window shows a notification bar once.
 (Before 2026-10-08 no log was ever created: the writer used IOUtils mode `"append"`, which refuses to create a
 missing file. It now uses `"appendOrCreate"`.)
 At startup it records the Firefox version, the background-pane painting path
@@ -86,7 +86,7 @@ decides, the content process's timestamp):
 layout goes to the screen. "Focus settled" is when Firefox reports the tab switch done (TabSwitched or the switcher's
 state) and focus has moved. Over 50 ms the line is a WARN; `FALLBACK TIMEOUT HIT` means a wait ran out (1.5 s)
 instead of ending on a Firefox event. No step polls or sleeps: the waits end on tab events. The last 50 timings are
-in `Tilefox.latencies` (Browser Console, in a window's context).
+in `Termfox.latencies` (Browser Console, in a window's context).
 
 ## Install (Windows)
 
@@ -100,10 +100,10 @@ in `Tilefox.latencies` (Browser Console, in a window's context).
    - download fx-autoconfig at pinned commit `dfdab56` and check every file's SHA-256
    - ask for **admin once (UAC)** to write exactly two files: `<Firefox>\config.js` and
      `<Firefox>\defaults\pref\config-prefs.js`. It refuses if a different autoconfig is already there.
-   - create a **new** profile `tilefox-spike` (`%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike`) and put the
+   - create a **new** profile `termfox` (`%APPDATA%\Mozilla\Firefox\Profiles\termfox`) and put the
      loader and our scripts in its `chrome\` folder. It touches no other profile.
-   - write a manifest to `%LOCALAPPDATA%\tilefox\install-manifest.json` for the uninstaller
-3. Start it with **`launch-tilefox.cmd`**, which runs `firefox.exe -P tilefox-spike -no-remote`. It can run next to your
+   - write a manifest to `%LOCALAPPDATA%\termfox\install-manifest.json` for the uninstaller
+3. Start it with **`launch-termfox.cmd`**, which runs `firefox.exe -P termfox -no-remote`. It can run next to your
    normal Firefox.
 4. In the spike profile, install Vimium from AMO, then work through `TEST.md`.
 
@@ -124,38 +124,56 @@ installed. Before editing `profiles.ini` it backs the file up to `%TEMP%`.
 ## Updating the scripts (after an edit)
 
 Run `node --test tests/*.test.mjs`, copy the changed files from `profile\chrome\` into
-`%APPDATA%\Mozilla\Firefox\Profiles\tilefox-spike\chrome\`, then restart Firefox with `launch-tilefox.cmd`
+`%APPDATA%\Mozilla\Firefox\Profiles\termfox\chrome\` (`...\tilefox-spike\chrome\` for an install made
+before the rename), then restart Firefox with `launch-termfox.cmd`
 (it passes `-purgecaches`, so the startup cache never serves old scripts). Fully quit Firefox first: if it is
-still running, the new scripts don't load and no `tilefox.log` appears (2026-10-08: a session started at 14:02
+still running, the new scripts don't load and no `termfox.log` appears (2026-10-08: a session started at 14:02
 was still running the day-1 scripts, which had no file log). Prefix then r applies key prefs and
 the stylesheet live and marks the startup cache stale, but edited `.mjs` files only load after a restart
 (running modules can't be swapped in place). A full `uninstall.ps1` and `install.ps1` also works.
 
+## Renamed from tilefox (2026-10-08)
+
+The project was called **tilefox** until 2026-10-08. Installs made before the rename keep working:
+- Their profile is called `tilefox-spike`. `launch-termfox.cmd` uses the `termfox` profile if there is
+  one, else `tilefox-spike`. New installs create `termfox`.
+- `uninstall.ps1` also finds the old manifest (`%LOCALAPPDATA%\tilefox\install-manifest.json`) and removes
+  both the old and the new script names.
+- On first start, user-set `tilefox.*` prefs (`enabled`, `statusbar`, `keys.*`) are copied once to
+  `termfox.*` (logged as `prefs: copied from tilefox.*`). Change the `termfox.*` ones from then on.
+  The old profile's `user.js` still sets `tilefox.enabled`, which now does nothing.
+- Windows and layouts saved under the old SessionStore names (`tilefox-windows`, `tilefox-tab`) are read
+  when the new ones are missing, then saved under the new names.
+- The log is now `termfox.log`. An old `tilefox.log` in the profile is left as it was.
+- To update an old install, copy `profile\chrome\` over the profile's `chrome\` folder and delete
+  `chrome\JS\tilefox.uc.mjs`, `chrome\JS\tilefox_actor.sys.mjs`, `chrome\JS\tilefox\` and
+  `chrome\CSS\tilefox.uc.css`. Otherwise both versions load.
+
 ## Files
 
 ```
-install.ps1 / uninstall.ps1 / launch-tilefox.cmd
-profile/chrome/JS/tilefox.uc.mjs                  per-window script: layout, keys, palette, kill switch
-profile/chrome/JS/tilefox_actor.sys.mjs           registers the JSWindowActor once per session
-profile/chrome/JS/tilefox/TilefoxChild.sys.mjs    content process: is the focus editable? routes Ctrl+Arrow
-profile/chrome/JS/tilefox/TilefoxParent.sys.mjs   forwards actor messages/log lines to the window
-profile/chrome/JS/tilefox/TilefoxCore.sys.mjs     pure helpers: key map, geometry, paint hook, file log
+install.ps1 / uninstall.ps1 / launch-termfox.cmd
+profile/chrome/JS/termfox.uc.mjs                  per-window script: layout, keys, palette, kill switch
+profile/chrome/JS/termfox_actor.sys.mjs           registers the JSWindowActor once per session
+profile/chrome/JS/termfox/TermfoxChild.sys.mjs    content process: is the focus editable? routes Ctrl+Arrow
+profile/chrome/JS/termfox/TermfoxParent.sys.mjs   forwards actor messages/log lines to the window
+profile/chrome/JS/termfox/TermfoxCore.sys.mjs     pure helpers: key map, geometry, paint hook, file log
 tests/core.test.mjs                               node --test tests/*.test.mjs (pure helpers)
-tests/windows.test.mjs                            runs tilefox.uc.mjs against a fake gBrowser + SessionStore
-profile/chrome/CSS/tilefox.uc.css                 pane geometry, focus frame, palette
+tests/windows.test.mjs                            runs termfox.uc.mjs against a fake gBrowser + SessionStore
+profile/chrome/CSS/termfox.uc.css                 pane geometry, focus frame, palette
 ```
 
 ## Known limits (spike)
 
-- **One layout per tilefox window.** Splitting a tab outside it starts a new layout for that window. Windows and
+- **One layout per termfox window.** Splitting a tab outside it starts a new layout for that window. Windows and
   layouts persist across restarts; see "Windows".
 - **No resizing.** Every split is 50/50 and there are no splitters yet.
 - **Firefox-internal APIs.** Panes rely on Firefox internals (present in 157.0.1 and 158): shadowing
   `gBrowser.splitViewBrowsers` so background panes keep painting, plus the `#tabbrowser-tabpanels` deck CSS.
   If `splitViewBrowsers` disappears it falls back to patching the tab switcher, then to re-activating pane
-  browsers after each tab switch; `tilefox.log` says which path is in use. A Firefox update can break this, and
+  browsers after each tab switch; `termfox.log` says which path is in use. A Firefox update can break this, and
   the kill switch is the escape hatch. Smoke-test after each Firefox update.
-- **Firefox's own Split View** (tab context menu → Split View) and tilefox panes don't mix. Tilefox refuses to
+- **Firefox's own Split View** (tab context menu → Split View) and termfox panes don't mix. Termfox refuses to
   split a tab that's already in a native split.
 - **Outside text fields**, Ctrl+Y splits instead of redo, Ctrl+H splits instead of opening History (use
   Ctrl+Shift+H, Library) and Ctrl+A opens the prefix instead of selecting the whole page. Inside fields they keep

@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name           tilefox
+// @name           termfox
 // @description    Day-1 spike: tmux/i3-style panes inside one Firefox window.
 // @version        0.1.0-spike
 // ==/UserScript==
@@ -9,13 +9,13 @@
  *   https://github.com/MrOtherGuy/fx-autoconfig#usage
  * Pinned loader commit: dfdab5684faffc112b76ccb1d8cab7f75da0102c (loader @version 0.10.16)
  * Target: Firefox Release 157.0.1 and 158+ (checked against tag FIREFOX_157_0_1_RELEASE, 2026-10-08).
- * Everything that touches Firefox internals is feature-detected and logged to <profile>/tilefox.log.
+ * Everything that touches Firefox internals is feature-detected and logged to <profile>/termfox.log.
  *
  * HOW PANES WORK (riskiest part, read this first)
  * - Every pane is a real tab. We never reparent <browser> elements (reparenting would
  *   destroy and reload the page). Instead, every pane's existing <tabpanel> child of
  *   #tabbrowser-tabpanels is made visible and absolutely positioned with % insets.
- *   Hidden deck panels use -moz-subtree-hidden-only-visually; tilefox.uc.css overrides it.
+ *   Hidden deck panels use -moz-subtree-hidden-only-visually; termfox.uc.css overrides it.
  *   https://searchfox.org/mozilla-central/source/toolkit/content/xul.css  ("deck, tabpanels & stack")
  * - Firefox only paints the selected tab. AsyncTabSwitcher keeps a background browser
  *   painting only if shouldDeactivateDocShell() is false, i.e. if it is in
@@ -29,7 +29,7 @@
  *   the layout is hidden (suspended) and comes back when you select one of its tabs.
  *
  * WINDOWS (tmux windows inside this Firefox window; model = Core.WindowSet)
- * - Every tab belongs to exactly one tilefox window (ws.owner). Each window has its own pane
+ * - Every tab belongs to exactly one termfox window (ws.owner). Each window has its own pane
  *   layout (window.root). Switching windows shows that window's tabs with gBrowser.showTab(),
  *   selects its remembered tab, and hides every other window's tabs with gBrowser.hideTab()
  *   (the same API extensions use; Tabbrowser.sys.mjs in 157). Nothing reloads: hidden tabs keep
@@ -38,12 +38,12 @@
  * - Pinned tabs can't be hidden (hideTab refuses), so they show in every window.
  * - New tabs (links, Ctrl+T, splits) join the current window (TabOpen). Selecting a tab of
  *   another window (palette, Firefox picking a tab after a close) switches to that window.
- * - Persisted with SessionStore: window value "tilefox-windows" (names, indices, layouts by tab
- *   uid, current/last) and tab value "tilefox-tab" ({w, u}); re-read on SSWindowRestored and
+ * - Persisted with SessionStore: window value "termfox-windows" (names, indices, layouts by tab
+ *   uid, current/last) and tab value "termfox-tab" ({w, u}); re-read on SSWindowRestored and
  *   promiseAllWindowsRestored, and per tab on SSTabRestoring (undo close tab).
- * - Each Firefox window (Ctrl+N) has its own TilefoxWindow, so its own windows and status bar.
+ * - Each Firefox window (Ctrl+N) has its own TermfoxWindow, so its own windows and status bar.
  *
- * KEYS (mirror ~/.tmux.conf; the table is Core.KEYMAP, overridable with tilefox.keys.<id> prefs)
+ * KEYS (mirror ~/.tmux.conf; the table is Core.KEYMAP, overridable with termfox.keys.<id> prefs)
  * - Primary path: one capture-phase keydown listener on the chrome window. It sees every key
  *   before Firefox's <key> handlers and before the event is forwarded to web content, and logs
  *   each decision (Core.routeChromeKey).
@@ -52,39 +52,39 @@
  *   Core.PressLedger matches each path to the press it came from, so one press runs once.
  *   https://github.com/MrOtherGuy/fx-autoconfig#hotkeys
  * - "Pass when typing" keys (Ctrl+Y/H, Ctrl+Arrow, Ctrl+A) aimed at web content are decided in
- *   the content process by TilefoxChild (editable check) when that browser's actor has said
+ *   the content process by TermfoxChild (editable check) when that browser's actor has said
  *   hello; otherwise, and for chrome focus, decided here. Their Firefox <key>s stay enabled, so
  *   a passed-through key still does its normal job (redo, history, select all, word-jump); a
  *   taken key is preventDefault()ed, which stops the XUL <key> from firing.
  */
 
-const Core = ChromeUtils.importESModule("chrome://userscripts/content/tilefox/TilefoxCore.sys.mjs");
-const PREF_ENABLED = "tilefox.enabled";
-const PREF_STATUSBAR = "tilefox.statusbar";
+const Core = ChromeUtils.importESModule("chrome://userscripts/content/termfox/TermfoxCore.sys.mjs");
+const PREF_ENABLED = "termfox.enabled";
+const PREF_STATUSBAR = "termfox.statusbar";
 const PREF_KEYS_BRANCH = Core.KEY_PREF_BRANCH;
 const logger = Core.getLogger();
 const LOG = (...a) => logger.log(...a);
 const ERR = (...a) => logger.error(...a);
 
-// The TilefoxWindow of a Firefox window. Core's registry is the source of truth (the parent actor
-// and fx-autoconfig's hotkey commands run in other modules); window.Tilefox is kept for debugging.
-const tilefoxOf = w => Core.instanceForWindow(w) ?? w?.Tilefox ?? null;
+// The TermfoxWindow of a Firefox window. Core's registry is the source of truth (the parent actor
+// and fx-autoconfig's hotkey commands run in other modules); window.Termfox is kept for debugging.
+const termfoxOf = w => Core.instanceForWindow(w) ?? w?.Termfox ?? null;
 
 const ARROW_KEYS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"]);
-const SCRIPT_FILES = ["tilefox.uc.mjs", "tilefox_actor.sys.mjs"];
-const STYLE_FILE = "tilefox.uc.css";
+const SCRIPT_FILES = ["termfox.uc.mjs", "termfox_actor.sys.mjs"];
+const STYLE_FILE = "termfox.uc.css";
 
 // Original Firefox <key> elements that our "always" bindings replace (computed from the key map).
 // Matched by key + normalized modifiers instead of id, because ids/labels move between releases.
 //   Alt+Left/Right  goBackKb / goForwardKb (Back / Forward)  browser/base/content/browser-sets.inc.xhtml
 //   Ctrl+Shift+P    key_privatebrowsing (new private window)
 // "Pass when typing" keys (Ctrl+Y redo, Ctrl+H history, Ctrl+A select all) are NOT disabled, so
-// they keep working when tilefox passes them through.
+// they keep working when termfox passes them through.
 function overriddenKeys(keyMap) {
   return keyMap.bindings.filter(b => b.typing === "take" && b.action !== "kill").map(b => Core.comboToOriginalKey(b.combo));
 }
 
-class TilefoxWindow {
+class TermfoxWindow {
   constructor(win) {
     this.win = win;
     this.doc = win.document;
@@ -108,7 +108,7 @@ class TilefoxWindow {
     this.switchWaitMs = 1500; // fallback only: longest wait for a tab switch (logged as a miss if hit)
     this.waiters = new Set(); // waitFor() checks, re-run on every tab / tab-switch event
     this.timing = null; // the running action's Core.ActionTiming
-    this.latencies = []; // last 50 finished timings (debugging: Tilefox.latencies in the Browser Console)
+    this.latencies = []; // last 50 finished timings (debugging: Termfox.latencies in the Browser Console)
     this.actorBrowsers = new WeakSet(); // browsers whose content actor has said hello
     this.paintPath = "none";
     this.loadKeyMap();
@@ -121,7 +121,7 @@ class TilefoxWindow {
     return Services.prefs.getBoolPref(PREF_ENABLED, true);
   }
 
-  // The layout of the current tilefox window (or of layoutId while withLayoutOf runs).
+  // The layout of the current termfox window (or of layoutId while withLayoutOf runs).
   get root() {
     return this.ws.get(this.layoutId ?? this.ws.current)?.root ?? null;
   }
@@ -159,7 +159,7 @@ class TilefoxWindow {
     this.buildPanel();
 
     this.buildStatusBar();
-    logger.setOnWriteError((e, path) => this.notify(`tilefox: cannot write ${path} (${e?.message || e}). Details in the Browser Console (Ctrl+Shift+J).`));
+    logger.setOnWriteError((e, path) => this.notify(`termfox: cannot write ${path} (${e?.message || e}). Details in the Browser Console (Ctrl+Shift+J).`));
 
     const tc = this.gBrowser.tabContainer;
     for (const tab of this.gBrowser.tabs) {
@@ -187,7 +187,7 @@ class TilefoxWindow {
       e => ERR("promiseAllWindowsRestored", e));
     this.win.addEventListener("TabSwitchDone", () => this.safe(() => this.onSwitchDone()));
     this.win.addEventListener("TabSwitched", e => this.safe(() => this.onSwitched(e.detail?.tab)));
-    // Chrome-focus Ctrl+Arrow (URL bar, toolbar). Content focus is TilefoxChild's job.
+    // Chrome-focus Ctrl+Arrow (URL bar, toolbar). Content focus is TermfoxChild's job.
     this.win.addEventListener("keydown", e => this.safe(() => this.onChromeKeydown(e)), true);
     this.win.addEventListener("unload", () => { this.unloading = true; this.dissolve(); }, { once: true });
 
@@ -241,7 +241,7 @@ class TilefoxWindow {
     // Only "always" keys: a reserved <key> would fire before content could pass a key through.
     const defs = this.keyMap.bindings
       .filter(b => b.typing === "take")
-      .map(b => ({ id: b.action === "kill" ? "tilefox-kill" : `tilefox-${b.id}`, combo: b.combo, action: b.action }));
+      .map(b => ({ id: b.action === "kill" ? "termfox-kill" : `termfox-${b.id}`, combo: b.combo, action: b.action }));
     for (const d of defs) {
       const hk = Core.comboToHotkey(d.combo);
       try {
@@ -250,7 +250,7 @@ class TilefoxWindow {
           modifiers: hk.modifiers,
           key: hk.key,
           reserved: true,
-          command: win => tilefoxOf(win)?.onHotkey(d.action),
+          command: win => termfoxOf(win)?.onHotkey(d.action),
         });
         // Kill switch stays live even when disabled, so it can toggle back on.
         Promise.resolve(def.attachToWindow(this.win, { suppressOriginal: d.action !== "kill" })).then(
@@ -271,7 +271,7 @@ class TilefoxWindow {
   }
 
   logKeyReport() {
-    for (const id of [...this.ourKeyIds, "tilefox-kill"]) {
+    for (const id of [...this.ourKeyIds, "termfox-kill"]) {
       const el = this.doc.getElementById(id);
       LOG(`key check: #${id}`, el ? `present key=${el.getAttribute("key") || el.getAttribute("keycode")} modifiers=${el.getAttribute("modifiers")} disabled=${el.getAttribute("disabled") || "no"}` : "MISSING");
     }
@@ -404,7 +404,7 @@ class TilefoxWindow {
 
   doAction(action, via) {
     if (!this.enabled) {
-      LOG("action", action, "via", via, "- tilefox disabled, ignored");
+      LOG("action", action, "via", via, "- termfox disabled, ignored");
       return undefined;
     }
     switch (action) {
@@ -465,9 +465,9 @@ class TilefoxWindow {
     Services.prefs.setBoolPref(PREF_ENABLED, next);
     this.win.UC_API.Notifications.show({
       label: next
-        ? "tilefox enabled"
-        : "tilefox disabled: Firefox keys restored, panes dissolved. Ctrl+Alt+Shift+K turns it back on.",
-      type: "tilefox-kill",
+        ? "termfox enabled"
+        : "termfox disabled: Firefox keys restored, panes dissolved. Ctrl+Alt+Shift+K turns it back on.",
+      type: "termfox-kill",
       priority: next ? "info" : "warning",
       window: this.win,
     }).catch(() => {});
@@ -575,7 +575,7 @@ class TilefoxWindow {
     if (!this.restored || !this.isManaged(tab)) {
       return;
     }
-    const v = Core.parseTabValue(this.win.SessionStore.getCustomTabValue(tab, Core.TAB_VALUE));
+    const v = Core.parseTabValue(this.tabValue(tab));
     if (v) {
       const clash = this.liveTabs().some(t => t !== tab && this.uids.get(t) === v.u); // duplicated tab
       this.uids.set(tab, clash ? Core.randomId() : v.u);
@@ -597,14 +597,15 @@ class TilefoxWindow {
     }
     let data = null;
     try {
-      data = JSON.parse(SS.getCustomWindowValue(this.win, Core.WINDOWS_VALUE) || "null");
+      data = JSON.parse(SS.getCustomWindowValue(this.win, Core.WINDOWS_VALUE)
+        || SS.getCustomWindowValue(this.win, Core.LEGACY_WINDOWS_VALUE) || "null");
     } catch (e) {
       ERR("windows: bad saved window value, starting fresh", e);
     }
     const values = new Map();
     const seen = new Set();
     for (const tab of this.liveTabs()) {
-      const v = Core.parseTabValue(SS.getCustomTabValue(tab, Core.TAB_VALUE));
+      const v = Core.parseTabValue(this.tabValue(tab));
       if (v && !seen.has(v.u)) {
         seen.add(v.u);
         this.uids.set(tab, v.u);
@@ -644,6 +645,12 @@ class TilefoxWindow {
     this.apply();
     this.persistNow();
     LOG(`windows restored (${why}): ${this.ws.windows.length} window(s): ${this.statusText()}`);
+  }
+
+  // The saved tab value; falls back to the one written under the old tilefox name.
+  tabValue(tab) {
+    const SS = this.win.SessionStore;
+    return SS.getCustomTabValue(tab, Core.TAB_VALUE) || SS.getCustomTabValue(tab, Core.LEGACY_TAB_VALUE);
   }
 
   writeTabValue(tab) {
@@ -847,11 +854,11 @@ class TilefoxWindow {
     return this.ws.status();
   }
 
-  // tmux status line (toggle with the tilefox.statusbar pref). Sits under the toolbars.
+  // tmux status line (toggle with the termfox.statusbar pref). Sits under the toolbars.
   buildStatusBar() {
     const HTML = "http://www.w3.org/1999/xhtml";
     const bar = this.doc.createElementNS(HTML, "div");
-    bar.id = "tilefox-status";
+    bar.id = "termfox-status";
     const toolbox = this.doc.getElementById("navigator-toolbox");
     (toolbox || this.doc.getElementById("browser")?.parentNode)?.append(bar);
     bar.addEventListener("click", e => this.safe(() => {
@@ -880,7 +887,7 @@ class TilefoxWindow {
       const flag = w.id === this.ws.current ? "*" : w.id === this.ws.last ? "-" : "";
       span.textContent = `${w.index}:${w.name}${flag}`;
       span.dataset.wid = w.id;
-      span.className = "tilefox-win" + (flag === "*" ? " current" : "");
+      span.className = "termfox-win" + (flag === "*" ? " current" : "");
       span.title = `${this.tabsOf(w.id).length} tab(s). Click, or Alt+${w.index} / prefix ${w.index}`;
       return span;
     }));
@@ -950,7 +957,7 @@ class TilefoxWindow {
     const gb = this.gBrowser;
     const sel = gb.selectedTab;
     if (sel.splitview) {
-      this.notify("tilefox: this tab is in Firefox's own Split View. Unsplit it first (tab context menu).");
+      this.notify("termfox: this tab is in Firefox's own Split View. Unsplit it first (tab context menu).");
       return;
     }
     if (!this.root || !this.isPane(sel)) {
@@ -1142,7 +1149,7 @@ class TilefoxWindow {
     if (!p) {
       return;
     }
-    p.classList.remove("tilefox-pane");
+    p.classList.remove("termfox-pane");
     for (const prop of ["--tf-left", "--tf-top", "--tf-width", "--tf-height"]) {
       p.style.removeProperty(prop);
     }
@@ -1151,15 +1158,15 @@ class TilefoxWindow {
   apply() {
     const tabpanels = this.gBrowser.tabpanels;
     const visible = this.enabled && this.layoutVisible();
-    tabpanels.toggleAttribute("tilefox", visible);
+    tabpanels.toggleAttribute("termfox", visible);
     const rects = this.rects();
     for (const [tab, r] of rects) {
       const p = this.panelOf(tab);
       if (!p) {
         continue;
       }
-      p.classList.add("tilefox-pane");
-      // Only take effect under #tabbrowser-tabpanels[tilefox] (see tilefox.uc.css).
+      p.classList.add("termfox-pane");
+      // Only take effect under #tabbrowser-tabpanels[termfox] (see termfox.uc.css).
       p.style.setProperty("--tf-left", r.x + "%");
       p.style.setProperty("--tf-top", r.y + "%");
       p.style.setProperty("--tf-width", r.w + "%");
@@ -1196,17 +1203,17 @@ class TilefoxWindow {
   }
 
   publishPaneIds() {
-    // Tell content processes which browsers are panes (TilefoxChild reads this).
+    // Tell content processes which browsers are panes (TermfoxChild reads this).
     // Union across all windows, because sharedData is global.
     const ids = [];
     for (const w of Services.wm.getEnumerator("navigator:browser")) {
-      for (const b of tilefoxOf(w)?.activePaneBrowsers() || []) {
+      for (const b of termfoxOf(w)?.activePaneBrowsers() || []) {
         if (b.browserId) {
           ids.push(b.browserId);
         }
       }
     }
-    Services.ppmm.sharedData.set("tilefox:paneBrowserIds", ids);
+    Services.ppmm.sharedData.set("termfox:paneBrowserIds", ids);
     Services.ppmm.sharedData.flush();
   }
 
@@ -1281,7 +1288,7 @@ class TilefoxWindow {
       return take("kill switch");
     }
     if (!this.enabled) {
-      return decide("pass through (tilefox disabled)");
+      return decide("pass through (termfox disabled)");
     }
     const chromeEditable = !browser && this.chromeEditable(t);
     const { verdict, why } = Core.routeChromeKey(b, {
@@ -1321,18 +1328,18 @@ class TilefoxWindow {
     const doc = this.doc;
     const HTML = "http://www.w3.org/1999/xhtml";
     const panel = doc.createXULElement("panel");
-    panel.id = "tilefox-panel";
+    panel.id = "termfox-panel";
     panel.setAttribute("noautofocus", "true");
     panel.setAttribute("consumeoutsideclicks", "false");
     const box = doc.createElementNS(HTML, "div");
-    box.className = "tilefox-box";
+    box.className = "termfox-box";
     const hint = doc.createElementNS(HTML, "div");
-    hint.className = "tilefox-hint";
+    hint.className = "termfox-hint";
     const input = doc.createElementNS(HTML, "input");
-    input.className = "tilefox-input";
+    input.className = "termfox-input";
     input.setAttribute("placeholder", "jump to pane / tab...");
     const list = doc.createElementNS(HTML, "ul");
-    list.className = "tilefox-list";
+    list.className = "termfox-list";
     box.append(hint, input, list);
     panel.append(box);
     (doc.getElementById("mainPopupSet") || doc.documentElement).append(panel);
@@ -1374,7 +1381,7 @@ class TilefoxWindow {
     const cur = this.ws.get(this.ws.current);
     switch (mode) {
       case "prefix":
-        this.hint.textContent = "tilefox  y/h: split  arrows: move  x: unpane  |  c: new window  n/p: next/prev  l: last  0-9  ,: rename  w: windows  &: kill  |  f: palette  r: reload  Esc";
+        this.hint.textContent = "termfox  y/h: split  arrows: move  x: unpane  |  c: new window  n/p: next/prev  l: last  0-9  ,: rename  w: windows  &: kill  |  f: palette  r: reload  Esc";
         break;
       case "rename":
         this.hint.textContent = `(rename-window) ${cur?.index}: Enter to save, empty = automatic name, Esc to cancel`;
@@ -1473,12 +1480,12 @@ class TilefoxWindow {
     }
   }
 
-  // rank: 0 panes of the current window, 1 tilefox windows, 2 tabs of the current window,
-  // 3 tabs of other tilefox windows, 4+ anything in other Firefox windows.
+  // rank: 0 panes of the current window, 1 termfox windows, 2 tabs of the current window,
+  // 3 tabs of other termfox windows, 4+ anything in other Firefox windows.
   allItems(windowsOnly = false) {
     const items = [];
     for (const w of Services.wm.getEnumerator("navigator:browser")) {
-      const t = tilefoxOf(w);
+      const t = termfoxOf(w);
       const other = w !== this.win;
       for (const tw of t?.ws.windows || []) {
         const name = t.nameOf(tw);
@@ -1553,7 +1560,7 @@ class TilefoxWindow {
   }
 
   jumpTo(item) {
-    const t = tilefoxOf(item.win);
+    const t = termfoxOf(item.win);
     item.win.focus();
     if (item.wid) {
       t?.selectWindow(item.wid);
@@ -1582,7 +1589,7 @@ class TilefoxWindow {
     }
     let windows = 0;
     for (const w of Services.wm.getEnumerator("navigator:browser")) {
-      const t = tilefoxOf(w);
+      const t = termfoxOf(w);
       t?.safe(() => {
         t.loadKeyMap();
         t.applyKeyState();
@@ -1597,7 +1604,7 @@ class TilefoxWindow {
     }
     const problems = this.keyMap.problems.length;
     LOG(`reload done: key map + layout in ${windows} window(s), css ${css ? "reloaded" : "NOT reloaded"}, startup cache cleared on next restart (${SCRIPT_FILES.join(", ")} edits apply after restart)`);
-    this.toast(problems ? `Reloaded (${problems} key config problem(s), see tilefox.log)` : "Reloaded");
+    this.toast(problems ? `Reloaded (${problems} key config problem(s), see termfox.log)` : "Reloaded");
   }
 
   // Brief self-closing message (tmux display-message). Its own panel, so it never takes focus
@@ -1606,16 +1613,16 @@ class TilefoxWindow {
     const doc = this.doc;
     if (!this.toastPanel) {
       const panel = doc.createXULElement("panel");
-      panel.id = "tilefox-toast";
+      panel.id = "termfox-toast";
       panel.setAttribute("noautofocus", "true");
       panel.setAttribute("consumeoutsideclicks", "false");
       const box = doc.createElementNS("http://www.w3.org/1999/xhtml", "div");
-      box.className = "tilefox-box";
+      box.className = "termfox-box";
       panel.append(box);
       (doc.getElementById("mainPopupSet") || doc.documentElement).append(panel);
       this.toastPanel = panel;
     }
-    this.toastPanel.firstChild.textContent = `tilefox: ${text}`;
+    this.toastPanel.firstChild.textContent = `termfox: ${text}`;
     this.win.clearTimeout(this.toastTimer);
     if (this.toastPanel.state === "closed") {
       const anchor = this.gBrowser.tabpanels;
@@ -1626,20 +1633,34 @@ class TilefoxWindow {
   }
 
   notify(label) {
-    this.win.UC_API.Notifications.show({ label, type: "tilefox", priority: "info", window: this.win }).catch(() => {});
+    this.win.UC_API.Notifications.show({ label, type: "termfox", priority: "info", window: this.win }).catch(() => {});
   }
 }
 
 // ---------------------------------------------------------------- boot
+// The project was called tilefox until 2026-10-08: carry its prefs over once (also done by the
+// actor module at startup; whichever runs first does it).
+function migratePrefs() {
+  try {
+    const copied = Core.migrateLegacyPrefs(Services.prefs);
+    if (copied.length) {
+      LOG("prefs: copied from tilefox.*:", copied.join(", "));
+    }
+  } catch (e) {
+    ERR("prefs: tilefox.* migration failed", e);
+  }
+}
+
 (function boot() {
   const win = window;
-  if (tilefoxOf(win)) {
+  if (termfoxOf(win)) {
     return;
   }
   const start = () => {
     try {
-      const t = new TilefoxWindow(win);
-      win.Tilefox = t;
+      migratePrefs(); // before the key map and the enabled pref are read
+      const t = new TermfoxWindow(win);
+      win.Termfox = t;
       const unregister = Core.registerInstance(t);
       win.addEventListener("unload", unregister, { once: true });
       t.init();
@@ -1648,7 +1669,7 @@ class TilefoxWindow {
     }
   };
   win.addEventListener("error", e => {
-    if (String(e.filename || "").includes("tilefox")) {
+    if (String(e.filename || "").includes("termfox")) {
       ERR("uncaught", e.error || e.message, `${e.filename}:${e.lineno}`);
     }
   });

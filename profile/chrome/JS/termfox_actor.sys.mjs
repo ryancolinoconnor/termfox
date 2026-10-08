@@ -1,11 +1,11 @@
 // ==UserScript==
-// @name           tilefox actor registration
-// @description    Registers the Tilefox JSWindowActor once per browser session (background module).
+// @name           termfox actor registration
+// @description    Registers the Termfox JSWindowActor once per browser session (background module).
 // ==/UserScript==
 
 // fx-autoconfig loads *.sys.mjs files in chrome/JS once at startup as background modules:
 //   https://github.com/MrOtherGuy/fx-autoconfig#backgroundmodule
-// Files in sub-folders (chrome/JS/tilefox/) are NOT auto-loaded; they are only reached
+// Files in sub-folders (chrome/JS/termfox/) are NOT auto-loaded; they are only reached
 // through the chrome://userscripts/content/ mapping in chrome/utils/chrome.manifest.
 //
 // We use the stable ChromeUtils.registerWindowActor API rather than fx-autoconfig's
@@ -13,17 +13,27 @@
 //   https://firefox-source-docs.mozilla.org/dom/ipc/jsactors.html
 //   https://searchfox.org/mozilla-central/source/dom/chrome-webidl/ChromeUtils.webidl (registerWindowActor)
 
-const { getLogger } = ChromeUtils.importESModule("chrome://userscripts/content/tilefox/TilefoxCore.sys.mjs");
+const { getLogger, migrateLegacyPrefs } = ChromeUtils.importESModule("chrome://userscripts/content/termfox/TermfoxCore.sys.mjs");
 const log = getLogger();
+
+// Renamed from tilefox (2026-10-08): copy user-set tilefox.* prefs to termfox.* once.
+try {
+  const copied = migrateLegacyPrefs(Services.prefs);
+  if (copied.length) {
+    log.log("prefs: copied from tilefox.*:", copied.join(", "));
+  }
+} catch (e) {
+  log.error("prefs: tilefox.* migration failed", e);
+}
 
 try {
   log.log(`startup: Firefox ${Services.appinfo.version} (build ${Services.appinfo.appBuildID}), log file ${log.path}`);
-  ChromeUtils.registerWindowActor("Tilefox", {
+  ChromeUtils.registerWindowActor("Termfox", {
     parent: {
-      esModuleURI: "chrome://userscripts/content/tilefox/TilefoxParent.sys.mjs",
+      esModuleURI: "chrome://userscripts/content/termfox/TermfoxParent.sys.mjs",
     },
     child: {
-      esModuleURI: "chrome://userscripts/content/tilefox/TilefoxChild.sys.mjs",
+      esModuleURI: "chrome://userscripts/content/termfox/TermfoxChild.sys.mjs",
       events: {
         // capture: run before the page's own handlers, so a page cannot swallow
         // Ctrl+Arrow before we've checked editability. We still bail out in editables.

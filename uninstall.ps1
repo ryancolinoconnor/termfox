@@ -1,10 +1,11 @@
 <#
 .SYNOPSIS
-  Removes exactly what tilefox install.ps1 added, using its manifest
-  (%LOCALAPPDATA%\tilefox\install-manifest.json):
+  Removes exactly what termfox install.ps1 added, using its manifest
+  (%LOCALAPPDATA%\termfox\install-manifest.json, or %LOCALAPPDATA%\tilefox\install-manifest.json for an
+  install made before the rename to termfox, whose profile is "tilefox-spike"):
     - <Firefox>\config.js and <Firefox>\defaults\pref\config-prefs.js (admin; only files the
       installer created, and only if they are still byte-identical to what it wrote)
-    - the "tilefox-spike" profile: its [ProfileN] entry in profiles.ini and its folders
+    - the "termfox" (or old "tilefox-spike") profile: its [ProfileN] entry in profiles.ini and its folders
     - the manifest folder
   Other profiles are never touched. Close ALL Firefox windows first.
 
@@ -25,8 +26,25 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
-$ManifestDir  = Join-Path $env:LOCALAPPDATA "tilefox"
+$ManifestDir  = Join-Path $env:LOCALAPPDATA "termfox"
 $ManifestPath = Join-Path $ManifestDir "install-manifest.json"
+# Not in the elevated child: it gets the manifest path as -ManifestFile.
+if (-not $ElevatedProgramRemove -and -not (Test-Path -LiteralPath $ManifestPath)) {
+    # Install made before the rename (2026-10-08): same manifest format, old folder.
+    $legacyDir = Join-Path $env:LOCALAPPDATA "tilefox"
+    if (Test-Path -LiteralPath (Join-Path $legacyDir "install-manifest.json")) {
+        $ManifestDir  = $legacyDir
+        $ManifestPath = Join-Path $legacyDir "install-manifest.json"
+    }
+}
+# Our script files under <profile>\chrome, old and new names. The manifest of an install made before
+# the rename lists only the old names, but the renamed scripts may have been copied in since.
+$OurChromeFiles = @(
+    "JS\termfox.uc.mjs", "JS\termfox_actor.sys.mjs", "CSS\termfox.uc.css",
+    "JS\termfox\TermfoxChild.sys.mjs", "JS\termfox\TermfoxParent.sys.mjs", "JS\termfox\TermfoxCore.sys.mjs",
+    "JS\tilefox.uc.mjs", "JS\tilefox_actor.sys.mjs", "CSS\tilefox.uc.css",
+    "JS\tilefox\TilefoxChild.sys.mjs", "JS\tilefox\TilefoxParent.sys.mjs", "JS\tilefox\TilefoxCore.sys.mjs"
+)
 
 function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Removed([string]$path) { Write-Host "    removed  $path" -ForegroundColor Green }
@@ -117,7 +135,7 @@ if ($m.profileCreated -and -not $KeepProfile) {
             Write-Host "    Open about:profiles in Firefox, make another profile the default, then run uninstall.ps1 again." -ForegroundColor Yellow
             $KeepProfile = $true
         } elseif ($target) {
-            $backup = Join-Path $env:TEMP ("profiles.ini.before-tilefox-uninstall." + (Get-Date -Format "yyyyMMdd-HHmmss"))
+            $backup = Join-Path $env:TEMP ("profiles.ini.before-termfox-uninstall." + (Get-Date -Format "yyyyMMdd-HHmmss"))
             Copy-Item -LiteralPath $ini -Destination $backup
             Write-Host "    backup of profiles.ini: $backup"
             [void]$sections.Remove($target)
@@ -147,11 +165,15 @@ if ($m.profileCreated -and -not $KeepProfile) {
 }
 if ($KeepProfile -and $m.profileCreated) {
     # Keep the profile but take the mod out of it.
-    Write-Step "Keeping the profile; removing tilefox + loader files from it"
+    Write-Step "Keeping the profile; removing termfox + loader files from it"
     if (& $hasProp $m "profileFiles") {
         foreach ($f in $m.profileFiles) { if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; Write-Removed $f } }
     }
-    foreach ($d in @("chrome\JS\tilefox", "chrome\JS", "chrome\CSS", "chrome\utils", "chrome")) {
+    foreach ($rel in $OurChromeFiles) {
+        $f = Join-Path (Join-Path $m.profileDir "chrome") $rel
+        if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force; Write-Removed $f }
+    }
+    foreach ($d in @("chrome\JS\termfox", "chrome\JS\tilefox", "chrome\JS", "chrome\CSS", "chrome\utils", "chrome")) {
         $full = Join-Path $m.profileDir $d
         if ((Test-Path -LiteralPath $full) -and -not (Get-ChildItem -LiteralPath $full -Force)) { Remove-Item -LiteralPath $full -Force; Write-Removed $full }
     }
@@ -162,7 +184,7 @@ $toRemove = @($m.programFiles | Where-Object { $_.Created })
 if ($toRemove.Count -gt 0) {
     Write-Step "Admin step: remove files from the Firefox program folder"
     foreach ($f in $toRemove) { Write-Host "      $($f.Path)" }
-    $resultFile = Join-Path $env:TEMP ("tilefox-uninstall-" + [guid]::NewGuid().ToString("N") + ".json")
+    $resultFile = Join-Path $env:TEMP ("termfox-uninstall-" + [guid]::NewGuid().ToString("N") + ".json")
     $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$($MyInvocation.MyCommand.Path)`"",
                  "-ElevatedProgramRemove", "-ManifestFile", "`"$ManifestPath`"", "-ResultFile", "`"$resultFile`"")
     try { Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argList -Wait | Out-Null }
@@ -181,5 +203,5 @@ if ($KeepProfile -and $m.profileCreated) {
 Remove-Item -LiteralPath $ManifestDir -Recurse -Force
 Write-Removed $ManifestDir
 Write-Host ""
-Write-Host "tilefox uninstalled." -ForegroundColor White
+Write-Host "termfox uninstalled." -ForegroundColor White
 exit 0

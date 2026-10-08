@@ -1,4 +1,4 @@
-// node --test tests/   (pure helpers from TilefoxCore.sys.mjs; no Firefox needed)
+// node --test tests/   (pure helpers from TermfoxCore.sys.mjs; no Firefox needed)
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -7,7 +7,7 @@ import {
   layoutRects, findNeighbour, fuzzy, isEditable, installPaintHook, createFileLogger,
   WindowSet, serializeLayout, deserializeLayout, autoWindowName, parseTabValue, PREFIX_KEYS,
   PressLedger, routeChromeKey as routeChrome,
-} from "../profile/chrome/JS/tilefox/TilefoxCore.sys.mjs";
+} from "../profile/chrome/JS/termfox/TermfoxCore.sys.mjs";
 
 const ev = (key, mods = {}, code) => ({
   key, code: code ?? (key.length === 1 ? "Key" + key.toUpperCase() : key),
@@ -136,14 +136,14 @@ test("prefs override the table: rebind, swap, unbind", () => {
   assert.equal(actionFor(k, ev("y", ctrl)), "split-col");
   assert.equal(actionFor(k, ev("a", ctrl)), null);
   assert.equal(actionFor(k, ev(" ", ctrl, "Space")), "prefix");
-  assert.equal(keyPref("splitRight"), "tilefox.keys.splitRight"); // pref names from the first spike still work
+  assert.equal(keyPref("splitRight"), "termfox.keys.splitRight"); // pref names from the first spike still work
 });
 
 test("bad pref values fall back to defaults; clashes are reported", () => {
   const k = resolveKeyMap(n => (n === keyPref("splitDown") ? "Ctrl+Banana" : ""));
   assert.equal(comboToString(bindingFor(k, ev("h", ctrl)).combo), "Ctrl+H");
   assert.equal(k.problems.length, 1);
-  assert.match(k.problems[0], /tilefox\.keys\.splitDown/);
+  assert.match(k.problems[0], /termfox\.keys\.splitDown/);
   const clash = resolveKeyMap(n => (n === keyPref("palette") ? "Ctrl+Y" : ""));
   assert.equal(actionFor(clash, ev("y", ctrl)), "split-row"); // table order wins
   assert.match(clash.problems[0], /palette and splitRight are both Ctrl\+Y/);
@@ -332,7 +332,7 @@ test("logger appends lines with errors and stacks", async () => {
   const e = new Error("boom");
   log.error("caught", e);
   await log.flush();
-  const text = io.files.get("/prof/tilefox.log");
+  const text = io.files.get("/prof/termfox.log");
   assert.match(text, /INFO startup {"v":"157.0.1"}/);
   assert.match(text, /ERROR caught Error: boom\n[\s\S]*core\.test\.mjs/);
 });
@@ -344,9 +344,9 @@ test("logger rotates at maxBytes", async () => {
     log.log("line", i, "x".repeat(40));
   }
   await log.flush();
-  assert.ok(io.files.has("/p/tilefox.log.1"));
-  assert.ok(new TextEncoder().encode(io.files.get("/p/tilefox.log")).length <= 200);
-  assert.match(io.files.get("/p/tilefox.log"), /line 9/);
+  assert.ok(io.files.has("/p/termfox.log.1"));
+  assert.ok(new TextEncoder().encode(io.files.get("/p/termfox.log")).length <= 200);
+  assert.match(io.files.get("/p/termfox.log"), /line 9/);
 });
 
 test("logger creates the file on first write (regression: IOUtils 'append' never creates it)", async () => {
@@ -354,7 +354,7 @@ test("logger creates the file on first write (regression: IOUtils 'append' never
   const log = createFileLogger({ io, dir: "/fresh", joinPath: (...p) => p.join("/"), consoleObj: quiet });
   log.log("first line");
   await log.flush();
-  assert.match(io.files.get("/fresh/tilefox.log"), /INFO first line/);
+  assert.match(io.files.get("/fresh/termfox.log"), /INFO first line/);
   assert.equal(log.failures, 0);
 });
 
@@ -372,8 +372,8 @@ test("logger surfaces write failures to the console and the window, once", async
   await log.flush();
   assert.equal(log.failures, 2);
   assert.match(String(log.lastError), /denied/);
-  assert.equal(errors.filter(e => e.includes("CANNOT WRITE LOG FILE /ro/tilefox.log")).length, 1);
-  assert.deepEqual(seen, ["/ro/tilefox.log"]);
+  assert.equal(errors.filter(e => e.includes("CANNOT WRITE LOG FILE /ro/termfox.log")).length, 1);
+  assert.deepEqual(seen, ["/ro/termfox.log"]);
 });
 
 // ---- windows (tmux windows inside one Firefox window)

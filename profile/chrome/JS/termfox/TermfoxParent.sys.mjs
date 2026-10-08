@@ -1,8 +1,8 @@
-/* tilefox parent-side actor: forwards actions, hellos and log lines from content to the window. */
+/* termfox parent-side actor: forwards actions, hellos and log lines from content to the window. */
 
-import { getLogger, instanceCount, instanceForBrowser } from "./TilefoxCore.sys.mjs";
+import { getLogger, instanceCount, instanceForBrowser } from "./TermfoxCore.sys.mjs";
 
-// Logged once per session: how the old `ownerGlobal.Tilefox` lookup compares with the registry.
+// Logged once per session: how the old `ownerGlobal.Termfox` lookup compares with the registry.
 let diagnosed = false;
 
 function describeOwner(browser, inst) {
@@ -11,7 +11,7 @@ function describeOwner(browser, inst) {
   const out = {
     ownerGlobal: win ? typeof win : String(win),
     sameAsInstanceWin: !!inst && win === inst.win,
-    hasTilefoxProp: (() => { try { return !!win?.Tilefox; } catch (e) { return `throws ${e}`; } })(),
+    hasTermfoxProp: (() => { try { return !!win?.Termfox; } catch (e) { return `throws ${e}`; } })(),
     instances: instanceCount(),
   };
   try {
@@ -24,38 +24,38 @@ function describeOwner(browser, inst) {
   return JSON.stringify(out);
 }
 
-export class TilefoxParent extends JSWindowActorParent {
+export class TermfoxParent extends JSWindowActorParent {
   receiveMessage(message) {
     const log = getLogger();
     try {
       // browsingContext.top.embedderElement is the <browser> in the chrome window.
       const browser = this.browsingContext?.top?.embedderElement;
-      if (message.name === "Tilefox:Log") {
+      if (message.name === "Termfox:Log") {
         log.log(`[content bid=${browser?.browserId}]`, String(message.data?.msg));
         return;
       }
       const t = instanceForBrowser(browser);
-      if (!diagnosed && (message.name === "Tilefox:Hello" || message.name === "Tilefox:Action")) {
+      if (!diagnosed && (message.name === "Termfox:Hello" || message.name === "Termfox:Action")) {
         let direct = null;
-        try { direct = browser?.ownerGlobal?.Tilefox; } catch (e) {}
+        try { direct = browser?.ownerGlobal?.Termfox; } catch (e) {}
         if (!t || direct !== t) {
           diagnosed = true;
-          log.warn("actor: window lookup", t ? "found via registry, ownerGlobal.Tilefox did not match" : "failed", describeOwner(browser, t));
+          log.warn("actor: window lookup", t ? "found via registry, ownerGlobal.Termfox did not match" : "failed", describeOwner(browser, t));
         }
       }
       switch (message.name) {
-        case "Tilefox:Hello":
+        case "Termfox:Hello":
           if (t) {
             t.onActorHello(browser, message.data);
           } else {
-            log.warn(`actor hello from browser ${browser?.browserId} but no Tilefox in its window`);
+            log.warn(`actor hello from browser ${browser?.browserId} but no Termfox in its window`);
           }
           break;
-        case "Tilefox:Action":
+        case "Termfox:Action":
           if (t) {
             t.onActorAction(message.data, browser);
           } else {
-            log.warn("actor action but no Tilefox in window", JSON.stringify(message.data));
+            log.warn("actor action but no Termfox in window", JSON.stringify(message.data));
           }
           break;
       }

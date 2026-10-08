@@ -1,5 +1,5 @@
 // node --test tests/*.test.mjs
-// Runs the real tilefox.uc.mjs against a fake gBrowser + SessionStore (no Firefox): tmux windows
+// Runs the real termfox.uc.mjs against a fake gBrowser + SessionStore (no Firefox): tmux windows
 // (new / select / last / kill / close-last-tab / persistence). The fake follows Firefox 157's
 // rules that matter here: hideTab refuses the selected and pinned tabs, and a closed selected
 // tab blurs to its successor first, else to a visible tab (Tabbrowser._findTabToBlurTo).
@@ -7,9 +7,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import vm from "node:vm";
-import * as Core from "../profile/chrome/JS/tilefox/TilefoxCore.sys.mjs";
+import * as Core from "../profile/chrome/JS/termfox/TermfoxCore.sys.mjs";
 
-const SRC = readFileSync(new URL("../profile/chrome/JS/tilefox.uc.mjs", import.meta.url), "utf8");
+const SRC = readFileSync(new URL("../profile/chrome/JS/termfox.uc.mjs", import.meta.url), "utf8");
 const tick = () => new Promise(r => setTimeout(r, 5));
 
 function el(tag = "div") {
@@ -31,8 +31,8 @@ function el(tag = "div") {
 // finishes `switchDelay` ms after selection, like AsyncTabSwitcher. switchEvents: which events the
 // finished switch sends. Firefox 157 with live panes sends TabSwitched ({detail: {tab}}) but its
 // TabSwitchDone (switcher finish()) can stay out (live log 2026-10-08 18:57).
-function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents = ["TabSwitched", "TabSwitchDone"] } = {}) {
-  const prefs = new Map();
+function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents = ["TabSwitched", "TabSwitchDone"], userPrefs = {} } = {}) {
+  const prefs = new Map(Object.entries(userPrefs));
   const tcListeners = {};
   const winListeners = {};
   const emit = (map, type, target, detail) => (map[type] || []).forEach(f => f({ target, detail }));
@@ -111,11 +111,11 @@ function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents
     addEventListener(t, f) { (winListeners[t] ||= []).push(f); },
     UC_API: { Windows: { waitWindowLoading: async () => {} }, Notifications: { show: async () => {} } },
   };
-  // Tabs that existed before tilefox started (and their saved values, as SessionStore restores them).
+  // Tabs that existed before termfox started (and their saved values, as SessionStore restores them).
   for (const t of saved?.tabs || []) {
     const tab = gb.addTrustedTab("x", { label: t.label });
     tab.hidden = !!t.hidden;
-    if (t.value) { tabValues.set(tab, { [Core.TAB_VALUE]: t.value }); }
+    if (t.value) { tabValues.set(tab, { [t.key || Core.TAB_VALUE]: t.value }); }
   }
   if (!gb.tabs.length) { gb.addTrustedTab("x", { label: "mail" }); }
   gb.selectedTab = gb.tabs[saved?.selected ?? 0];
@@ -123,6 +123,10 @@ function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents
     prefs: {
       getBoolPref: (n, d) => (prefs.has(n) ? prefs.get(n) : d), setBoolPref: (n, v) => prefs.set(n, v),
       getStringPref: (n, d) => (prefs.has(n) ? prefs.get(n) : d), prefHasUserValue: n => prefs.has(n),
+      getIntPref: (n, d) => (prefs.has(n) ? prefs.get(n) : d), setIntPref: (n, v) => prefs.set(n, v), setStringPref: (n, v) => prefs.set(n, v),
+      getChildList: prefix => [...prefs.keys()].filter(n => n.startsWith(prefix)),
+      PREF_STRING: 32, PREF_INT: 64, PREF_BOOL: 128,
+      getPrefType: n => ({ boolean: 128, number: 64, string: 32 })[typeof prefs.get(n)] || 0,
       addObserver() {}, removeObserver() {},
     },
     appinfo: { version: "157.0.1" },
@@ -130,7 +134,7 @@ function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents
     ppmm: { sharedData: { set() {}, flush() {} } },
   };
   const ctx = vm.createContext({ window: win, Services, ChromeUtils: { importESModule: () => Core }, UC_API: win.UC_API, console, Date, Math, JSON, Promise });
-  return { win, gb, ctx, tabValues, winValues, saved: () => ({ win: { ...winValues } }) };
+  return { win, gb, ctx, prefs, tabValues, winValues, saved: () => ({ win: { ...winValues } }) };
 }
 
 async function boot(opts) {
@@ -138,13 +142,13 @@ async function boot(opts) {
   const quietLog = console.log; const quietErr = console.error; const quietWarn = console.warn;
   console.log = console.error = console.warn = () => {};
   try {
-    vm.runInContext(SRC, ff.ctx, { filename: "tilefox.uc.mjs" });
+    vm.runInContext(SRC, ff.ctx, { filename: "termfox.uc.mjs" });
     await tick(); await tick();
   } finally {
     console.log = quietLog; console.error = quietErr; console.warn = quietWarn;
   }
-  const T = ff.win.Tilefox;
-  assert.ok(T, "tilefox booted");
+  const T = ff.win.Termfox;
+  assert.ok(T, "termfox booted");
   const run = async a => { await T.runAction(a, "test"); await tick(); };
   const visible = () => ff.gb.tabs.filter(t => !t.hidden).map(t => t.label);
   return { ...ff, T, run, visible, status: () => T.statusText() };
@@ -246,10 +250,10 @@ test("rename, then names, membership and layouts survive a restart via SessionSt
 test("kill switch shows every tab; turning it back on hides other windows again", silence(async () => {
   const f = await boot();
   await f.run("new-window");
-  f.ctx.Services.prefs.setBoolPref("tilefox.enabled", false);
+  f.ctx.Services.prefs.setBoolPref("termfox.enabled", false);
   f.T.onEnabledChanged();
   assert.deepEqual(f.visible().sort(), ["mail", "tab1"]);
-  f.ctx.Services.prefs.setBoolPref("tilefox.enabled", true);
+  f.ctx.Services.prefs.setBoolPref("termfox.enabled", true);
   f.T.onEnabledChanged();
   assert.deepEqual(f.visible(), ["tab1"]);
 }));
@@ -387,14 +391,14 @@ test("a stuck action can't wedge the queue", silence(async () => {
   assert.equal(f.T.ws.windows.length, 2);
 }));
 
-// ---- parent actor -> window instance (live bug 2026-10-08: "actor action but no Tilefox in window")
+// ---- parent actor -> window instance (live bug 2026-10-08: "actor action but no Termfox in window")
 
-// Shaped like Firefox 157: TilefoxParent gets the <browser> from browsingContext.top.embedderElement,
-// and browser.ownerGlobal is not an object on which the window script's `window.Tilefox` shows up.
+// Shaped like Firefox 157: TermfoxParent gets the <browser> from browsingContext.top.embedderElement,
+// and browser.ownerGlobal is not an object on which the window script's `window.Termfox` shows up.
 globalThis.JSWindowActorParent ??= class {};
-const { TilefoxParent } = await import("../profile/chrome/JS/tilefox/TilefoxParent.sys.mjs");
+const { TermfoxParent } = await import("../profile/chrome/JS/termfox/TermfoxParent.sys.mjs");
 function actorFor(browser) {
-  const a = new TilefoxParent();
+  const a = new TermfoxParent();
   a.browsingContext = { browserId: browser.browserId, top: { embedderElement: browser } };
   a.browsingContext.top.top = a.browsingContext.top;
   return a;
@@ -408,23 +412,23 @@ async function captureWarnings(fn) {
   return warns;
 }
 
-test("parent actor finds the window when ownerGlobal.Tilefox is not visible (157): hello + Ctrl+A prefix from a page", silence(async () => {
+test("parent actor finds the window when ownerGlobal.Termfox is not visible (157): hello + Ctrl+A prefix from a page", silence(async () => {
   const f = await boot();
   const T = f.T;
   const page = browserEl(f.gb.tabs[0]);
-  page.ownerGlobal = { document: f.win.document }; // a different object: no Tilefox property on it
-  assert.equal(page.ownerGlobal.Tilefox, undefined, "the old lookup (ownerGlobal.Tilefox) fails here");
+  page.ownerGlobal = { document: f.win.document }; // a different object: no Termfox property on it
+  assert.equal(page.ownerGlobal.Termfox, undefined, "the old lookup (ownerGlobal.Termfox) fails here");
   const actor = actorFor(page);
   const warns = await captureWarnings(async () => {
-    send(actor, "Tilefox:Hello", { where: "https://example.com" });
+    send(actor, "Termfox:Hello", { where: "https://example.com" });
     assert.ok(T.actorBrowsers.has(page), "hello registers, so the window lets content decide typing");
     // Ctrl+A on <body>: the window defers to the actor, the actor says prefix.
     T.onChromeKeydown(keyEvent("a", { ctrlKey: true }, page));
-    send(actor, "Tilefox:Action", { action: "prefix", via: "content" });
+    send(actor, "Termfox:Action", { action: "prefix", via: "content" });
     await settled(T);
   });
   assert.equal(T.panel.state, "open", "prefix panel opened from a content-routed Ctrl+A");
-  assert.ok(!warns.some(w => w.includes("no Tilefox in window")), warns.join("\n"));
+  assert.ok(!warns.some(w => w.includes("no Termfox in window")), warns.join("\n"));
 }));
 
 test("parent actor resolves via ownerGlobal when it is the window, and each window gets its own actions", silence(async () => {
@@ -434,22 +438,22 @@ test("parent actor resolves via ownerGlobal when it is the window, and each wind
   pa.ownerGlobal = a.win;
   const pb = browserEl(b.gb.tabs[0]);
   pb.ownerGlobal = { other: true };
-  send(actorFor(pa), "Tilefox:Hello", {});
-  send(actorFor(pb), "Tilefox:Hello", {});
+  send(actorFor(pa), "Termfox:Hello", {});
+  send(actorFor(pb), "Termfox:Hello", {});
   assert.ok(a.T.actorBrowsers.has(pa) && !a.T.actorBrowsers.has(pb));
   assert.ok(b.T.actorBrowsers.has(pb) && !b.T.actorBrowsers.has(pa));
-  send(actorFor(pb), "Tilefox:Action", { action: "split-col", via: "content" });
+  send(actorFor(pb), "Termfox:Action", { action: "split-col", via: "content" });
   await settled(b.T);
   await settled(a.T);
   assert.equal(b.T.paneTabs().length, 2);
   assert.equal(a.T.paneTabs().length, 0);
 }));
 
-test("parent actor still warns for a browser no tilefox window owns", silence(async () => {
+test("parent actor still warns for a browser no termfox window owns", silence(async () => {
   await boot();
   const stray = { browserId: 999, ownerGlobal: {}, localName: "browser" };
-  const warns = await captureWarnings(() => send(actorFor(stray), "Tilefox:Action", { action: "prefix", via: "content" }));
-  assert.ok(warns.some(w => w.includes("actor action but no Tilefox in window")), warns.join("\n"));
+  const warns = await captureWarnings(() => send(actorFor(stray), "Termfox:Action", { action: "prefix", via: "content" }));
+  assert.ok(warns.some(w => w.includes("actor action but no Termfox in window")), warns.join("\n"));
 }));
 
 // ---- tab switch wait (live: "split: no TabSwitchDone after 1500 ms" on every split/focus)
@@ -513,10 +517,10 @@ test("latency: splits and focus moves end on tab events (no timeout fallback) wi
     for (const x of timings) {
       assert.deepEqual([...x.fallbacks], [], x.describe());
       assert.ok(x.layout != null && x.switch != null && x.layout <= x.switch && x.switch <= x.total, x.describe());
-      // tilefox's own share: key -> panes moved, plus switch event -> done. The rest is the
+      // termfox's own share: key -> panes moved, plus switch event -> done. The rest is the
       // (fake) Firefox tab switch, whose node timer can run late when the machine is busy.
       const own = x.layout + (x.total - x.switch);
-      assert.ok(own < 20, `tilefox overhead ${own.toFixed(1)} ms: ${x.describe()}`);
+      assert.ok(own < 20, `termfox overhead ${own.toFixed(1)} ms: ${x.describe()}`);
     }
     t.diagnostic(`switch ${switchDelay} ms: ` + timings.map(x =>
       `${x.action} ${x.total.toFixed(1)} (layout ${x.layout.toFixed(1)}, switch event ${x.switch.toFixed(1)})`).join(", "));
@@ -577,3 +581,43 @@ test("ActionTiming formats the log line and flags slow actions", () => {
   assert.ok(x.slow);
   assert.match(x.describe(), /over the 50 ms target$/);
 });
+
+// ---- renamed from tilefox (2026-10-08): old prefs and saved windows carry over
+
+test("tilefox.* user prefs are copied to termfox.* once; termfox.* values already set win", silence(async () => {
+  const f = await boot({ userPrefs: {
+    "tilefox.enabled": true, "tilefox.statusbar": false, "tilefox.keys.splitRight": "Alt+V",
+    "termfox.keys.splitDown": "Alt+S", "tilefox.keys.splitDown": "Alt+X",
+  } });
+  const p = f.prefs;
+  assert.equal(p.get("termfox.statusbar"), false);
+  assert.equal(p.get("termfox.keys.splitRight"), "Alt+V");
+  assert.equal(p.get("termfox.keys.splitDown"), "Alt+S", "an existing termfox pref is not overwritten");
+  assert.equal(p.get(Core.PREF_MIGRATED), true);
+  assert.equal(f.T.statusBar.hidden, true, "the copied statusbar pref is in effect");
+  // once only: a later change to the old pref (user.js) is not copied again
+  p.set("tilefox.statusbar", true);
+  assert.deepEqual([...Core.migrateLegacyPrefs(f.ctx.Services.prefs)], []);
+  assert.equal(p.get("termfox.statusbar"), false);
+}));
+
+test("windows saved under the tilefox SessionStore names are restored after the rename", silence(async () => {
+  const f = await boot();
+  await f.run("split-row");
+  f.T.renameWindow("inbox");
+  await f.run("new-window");
+  f.T.renameWindow("dev");
+  await f.run("last-window");
+  f.T.persistNow();
+  // As saved by tilefox: same JSON, old keys.
+  const saved = {
+    win: { [Core.LEGACY_WINDOWS_VALUE]: f.winValues[Core.WINDOWS_VALUE] },
+    tabs: f.gb.tabs.map(t => ({ label: t.label, hidden: t.hidden, key: Core.LEGACY_TAB_VALUE, value: f.tabValues.get(t)?.[Core.TAB_VALUE] })),
+    selected: f.gb.tabs.indexOf(f.gb.selectedTab),
+  };
+  const g = await boot({ saved });
+  assert.equal(g.status(), "0:inbox*  1:dev-");
+  assert.equal(g.T.paneTabs().length, 2);
+  assert.deepEqual(g.visible(), ["mail", "tab1"]);
+  assert.ok(g.winValues[Core.WINDOWS_VALUE], "re-saved under the termfox name");
+}));

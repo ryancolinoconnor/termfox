@@ -1,8 +1,8 @@
-/* tilefox core: pure helpers shared by the window script, the actors and the node tests.
+/* termfox core: pure helpers shared by the window script, the actors and the node tests.
  *
  * No Firefox globals at module top level, so `node --test` can import this file.
  * In Firefox it is loaded once per process with
- *   ChromeUtils.importESModule("chrome://userscripts/content/tilefox/TilefoxCore.sys.mjs")
+ *   ChromeUtils.importESModule("chrome://userscripts/content/termfox/TermfoxCore.sys.mjs")
  * so the file logger below is a single queue shared by every browser window.
  */
 
@@ -125,11 +125,11 @@ export function normMods(s) {
  *   typing: "pass" = like tmux's vim-aware `if-shell "$is_vim" "send-keys ..."`: when focus is in an
  *                    editable field the key goes to the page/field untouched (no Firefox key is
  *                    disabled, so Ctrl+Y redo, Ctrl+H history and Ctrl+A select-all still work there).
- *           "take" = like a plain `bind -n`: always tilefox, even while typing. The Firefox <key>s on
- *                    that combo are disabled while tilefox is enabled.
+ *           "take" = like a plain `bind -n`: always termfox, even while typing. The Firefox <key>s on
+ *                    that combo are disabled while termfox is enabled.
  *   noActor: what to do with a "pass" key aimed at web content whose content actor never said hello
  *            (so nobody can check editability): "take" (default) or "pass".
- * Every combo can be overridden with the string pref tilefox.keys.<id> ("none" unbinds it).
+ * Every combo can be overridden with the string pref termfox.keys.<id> ("none" unbinds it).
  */
 export const KEYMAP = [
   { id: "splitRight",       combo: "Ctrl+Y",     action: "split-row",   typing: "pass", tmux: "C-y split-window -h (vim-aware)" },
@@ -145,9 +145,9 @@ export const KEYMAP = [
   { id: "focusUpAlways",    combo: "Alt+Up",     action: "focus-up",    typing: "take", tmux: "M-Up select-pane -U" },
   { id: "focusDownAlways",  combo: "Alt+Down",   action: "focus-down",  typing: "take", tmux: "M-Down select-pane -D" },
   { id: "prefix",           combo: "Ctrl+A",     action: "prefix",      typing: "pass", noActor: "pass", tmux: "prefix C-a" },
-  { id: "prefixAlways",     combo: "Ctrl+Space", action: "prefix",      typing: "take", tmux: "(tilefox alias for the prefix)" },
-  { id: "palette",          combo: "Ctrl+Shift+P", action: "palette",   typing: "take", tmux: "(tilefox only)" },
-  { id: "kill",             combo: "Ctrl+Alt+Shift+K", action: "kill",  typing: "take", tmux: "(tilefox only)" },
+  { id: "prefixAlways",     combo: "Ctrl+Space", action: "prefix",      typing: "take", tmux: "(termfox alias for the prefix)" },
+  { id: "palette",          combo: "Ctrl+Shift+P", action: "palette",   typing: "take", tmux: "(termfox only)" },
+  { id: "kill",             combo: "Ctrl+Alt+Shift+K", action: "kill",  typing: "take", tmux: "(termfox only)" },
   // Windows (tmux windows inside one Firefox window). No-prefix quick keys; the tmux defaults
   // are on the prefix (PREFIX_KEYS). Alt+digits are free on Windows: Firefox 157 binds tab
   // selection to Alt+1..9 only on Linux (XP_GNOME), elsewhere to Ctrl+1..9 (browser-sets.inc.xhtml).
@@ -167,8 +167,41 @@ export const PREFIX_KEYS = {
   ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => [String(n), `select-window-${n}`])),
 };
 
-export const KEY_PREF_BRANCH = "tilefox.keys.";
+export const KEY_PREF_BRANCH = "termfox.keys.";
 export const keyPref = id => KEY_PREF_BRANCH + id;
+
+// ---------------------------------------------------------------- rename from tilefox (2026-10-08)
+
+export const LEGACY_PREF_BRANCH = "tilefox.";
+export const PREF_MIGRATED = "termfox.migratedFromTilefox";
+
+/**
+ * One-time copy of user-set tilefox.* prefs (enabled, statusbar, keys.*) to termfox.*.
+ * A termfox.* pref the user already set wins. The old prefs are left as they are (a user.js
+ * from a tilefox install keeps setting tilefox.enabled; it no longer does anything).
+ * prefs: nsIPrefBranch (Services.prefs). Returns the names copied.
+ */
+export function migrateLegacyPrefs(prefs) {
+  if (prefs.getBoolPref(PREF_MIGRATED, false)) {
+    return [];
+  }
+  const copied = [];
+  for (const old of prefs.getChildList(LEGACY_PREF_BRANCH)) {
+    const name = "termfox." + old.slice(LEGACY_PREF_BRANCH.length);
+    if (!prefs.prefHasUserValue(old) || prefs.prefHasUserValue(name)) {
+      continue;
+    }
+    switch (prefs.getPrefType(old)) {
+      case prefs.PREF_BOOL: prefs.setBoolPref(name, prefs.getBoolPref(old)); break;
+      case prefs.PREF_INT: prefs.setIntPref(name, prefs.getIntPref(old)); break;
+      case prefs.PREF_STRING: prefs.setStringPref(name, prefs.getStringPref(old)); break;
+      default: continue;
+    }
+    copied.push(name);
+  }
+  prefs.setBoolPref(PREF_MIGRATED, true);
+  return copied;
+}
 
 /**
  * KEYMAP + prefs -> {bindings: [{id, combo, action, typing, noActor, tmux}], problems: [...]}.
@@ -281,7 +314,7 @@ export function prefixActionFor(ev) {
 // ---------------------------------------------------------------- one press, one action
 
 /**
- * One key press can reach tilefox by up to three paths: the chrome window's capture keydown
+ * One key press can reach termfox by up to three paths: the chrome window's capture keydown
  * listener (always first), the reserved XUL <key> of an fx-autoconfig Hotkey (same dispatch,
  * after the listener), and the content actor (async IPC, which can arrive after later presses).
  * The ledger records what the keydown listener decided for each press, and each echo from the
@@ -575,8 +608,11 @@ export function fuzzy(q, text) {
 
 // ---------------------------------------------------------------- windows (tmux windows)
 
-export const WINDOWS_VALUE = "tilefox-windows"; // SessionStore window value: the WindowSet as JSON
-export const TAB_VALUE = "tilefox-tab";         // SessionStore tab value: {w: window id, u: tab uid}
+export const WINDOWS_VALUE = "termfox-windows"; // SessionStore window value: the WindowSet as JSON
+export const TAB_VALUE = "termfox-tab";         // SessionStore tab value: {w: window id, u: tab uid}
+// Written before the rename; read when the termfox value is missing so saved windows survive it.
+export const LEGACY_WINDOWS_VALUE = "tilefox-windows";
+export const LEGACY_TAB_VALUE = "tilefox-tab";
 
 export const randomId = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
@@ -804,12 +840,12 @@ export function installPaintHook(gb, getPaneBrowsers, note = () => {}) {
     const native = gb._getSwitcher;
     gb._getSwitcher = function (...args) {
       const sw = native.apply(this, args);
-      if (sw && !sw.__tilefox && typeof sw.shouldDeactivateDocShell === "function") {
+      if (sw && !sw.__termfox && typeof sw.shouldDeactivateDocShell === "function") {
         const orig = sw.shouldDeactivateDocShell;
         sw.shouldDeactivateDocShell = function (browser) {
           return getPaneBrowsers().includes(browser) ? false : orig.call(this, browser);
         };
-        sw.__tilefox = true;
+        sw.__termfox = true;
       }
       return sw;
     };
@@ -857,7 +893,7 @@ export function isEditable(el, doc) {
 
 // ---------------------------------------------------------------- file log
 
-export const LOG_FILE = "tilefox.log";
+export const LOG_FILE = "termfox.log";
 export const LOG_MAX_BYTES = 1024 * 1024;
 
 export function formatArg(a) {
@@ -875,13 +911,13 @@ export function formatArg(a) {
 }
 
 /**
- * Append-only log file with one rotation (tilefox.log -> tilefox.log.1 above maxBytes).
+ * Append-only log file with one rotation (termfox.log -> termfox.log.1 above maxBytes).
  * io: {writeUTF8(path, text, {mode}), stat(path) -> {size}, move(from, to), exists(path)} (IOUtils subset).
  * Writes are serialized through one promise chain.
  *
  * Mode must be "appendOrCreate". IOUtils' "append" refuses to create a missing file
  * (dom/chrome-webidl/IOUtils.webidl, WriteMode), so with "append" the very first write failed and
- * no tilefox.log ever appeared (the bug up to 2026-10-08). A failed write is now reported loudly
+ * no termfox.log ever appeared (the bug up to 2026-10-08). A failed write is now reported loudly
  * to the Browser Console (the first one with the path, then every 50th) and kept in
  * logger.lastError, and onWriteError(e, path) is called once so the window can show it.
  */
@@ -920,7 +956,7 @@ export function createFileLogger({ io, dir, joinPath, maxBytes = LOG_MAX_BYTES, 
       state.lastError = e;
       size = null; // re-stat next time
       if (failures === 1 || failures % 50 === 0) {
-        consoleObj.error(`[tilefox] CANNOT WRITE LOG FILE ${path} (failure #${failures}):`, e);
+        consoleObj.error(`[termfox] CANNOT WRITE LOG FILE ${path} (failure #${failures}):`, e);
       }
       if (failures === 1) {
         try { onWriteError(e, path); } catch (e2) {}
@@ -935,15 +971,15 @@ export function createFileLogger({ io, dir, joinPath, maxBytes = LOG_MAX_BYTES, 
     get failures() { return state.failures; },
     setOnWriteError(fn) { onWriteError = fn; if (state.lastError) { try { fn(state.lastError, path); } catch (e) {} } },
     log: (...a) => {
-      consoleObj.log("[tilefox]", ...a);
+      consoleObj.log("[termfox]", ...a);
       return write("INFO", a);
     },
     warn: (...a) => {
-      consoleObj.warn("[tilefox]", ...a);
+      consoleObj.warn("[termfox]", ...a);
       return write("WARN", a);
     },
     error: (...a) => {
-      consoleObj.error("[tilefox]", ...a);
+      consoleObj.error("[termfox]", ...a);
       return write("ERROR", a);
     },
     flush: () => chain,
@@ -953,11 +989,11 @@ export function createFileLogger({ io, dir, joinPath, maxBytes = LOG_MAX_BYTES, 
 // ---------------------------------------------------------------- window instances
 
 /*
- * One TilefoxWindow per Firefox window registers here. This module is a shared system module,
- * so the window script and TilefoxParent (the parent actor) get the same registry. The actor
- * used to read `browser.ownerGlobal.Tilefox`. On Firefox 157 that came back empty although the
- * window script had set `window.Tilefox`, so every content-routed action and hello was dropped
- * (log: "actor action but no Tilefox in window"). The registry doesn't depend on a window
+ * One TermfoxWindow per Firefox window registers here. This module is a shared system module,
+ * so the window script and TermfoxParent (the parent actor) get the same registry. The actor
+ * used to read `browser.ownerGlobal.Termfox`. On Firefox 157 that came back empty although the
+ * window script had set `window.Termfox`, so every content-routed action and hello was dropped
+ * (log: "actor action but no Termfox in window"). The registry doesn't depend on a window
  * property being visible across compartments. It also matches by browser element, so it keeps
  * working when `ownerGlobal` is not the same object the window script saw.
  */
@@ -1002,7 +1038,7 @@ export function instanceForBrowser(browser) {
 export const instanceCount = () => instances.size;
 
 // Process-wide logger for Firefox. Content processes can't write the profile, so actors
-// forward their lines to the parent ("Tilefox:Log") instead of using this.
+// forward their lines to the parent ("Termfox:Log") instead of using this.
 let sharedLogger = null;
 export function getLogger() {
   if (sharedLogger) {
@@ -1017,13 +1053,13 @@ export function getLogger() {
       dir: PathUtils.profileDir,
       joinPath: (...p) => PathUtils.join(...p),
     });
-    console.log(`[tilefox] file log: ${sharedLogger.path}`);
+    console.log(`[termfox] file log: ${sharedLogger.path}`);
   } else {
     sharedLogger = {
       path: null,
-      log: (...a) => console.log("[tilefox]", ...a),
-      warn: (...a) => console.warn("[tilefox]", ...a),
-      error: (...a) => console.error("[tilefox]", ...a),
+      log: (...a) => console.log("[termfox]", ...a),
+      warn: (...a) => console.warn("[termfox]", ...a),
+      error: (...a) => console.error("[termfox]", ...a),
       flush: () => Promise.resolve(),
       lastError: null,
       failures: 0,
