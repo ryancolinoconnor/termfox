@@ -94,7 +94,16 @@ export class TilefoxChild extends JSWindowActorChild {
       return;
     }
     this.log(`content: ${key} on <${el?.localName || "none"}> -> ${b.action} (${why})`);
-    this.sendAsyncMessage("Tilefox:Action", { action: b.action, via: b.typing === "take" ? "content-fallback" : "content" });
+    // t: when the key was pressed, on the epoch clock the window uses (timeOrigin + timeStamp), so
+    // the parent's latency line includes the content -> parent hop.
+    let t = Date.now();
+    try {
+      const perf = this.contentWindow?.performance;
+      if (perf?.timeOrigin && event.timeStamp > 0) {
+        t = perf.timeOrigin + event.timeStamp;
+      }
+    } catch (e) {}
+    this.sendAsyncMessage("Tilefox:Action", { action: b.action, via: b.typing === "take" ? "content-fallback" : "content", t });
   }
 
   receiveMessage() {}

@@ -72,6 +72,11 @@ Focus moves to the neighbouring pane:
 - [ ] Alt+Left does **not** go Back and Alt+Right does not go Forward (Vimium `H`/`L` still do)
 - [ ] With no pane in that direction, nothing happens and nothing breaks
 
+Speed (target: under ~50 ms per split or focus move):
+- [ ] Do 5 splits and 10 focus moves (mix Ctrl and Alt). Every one feels instant
+- [ ] In `tilefox.log`, every action has a line like `split-col done in 37 ms: layout applied 1 ms, focus settled 37 ms (queue wait 0 ms, tab switch 36 ms, via keydown)` and a `next frame N ms after the key` line. Send these lines. Lines over 50 ms are WARN and end in `over the 50 ms target`
+- [ ] No line says `FALLBACK TIMEOUT HIT` (that means Firefox never reported the tab switch and tilefox waited 1.5 s)
+
 ## 5. Prefix, reload and palette, ~10 min
 
 - [ ] Ctrl+A on page text (not in a field) shows the hint bar; **y** (right), **h** (down) and the arrows then work like Ctrl+Y/H/arrows. Esc cancels, and it closes by itself after ~2.5 s

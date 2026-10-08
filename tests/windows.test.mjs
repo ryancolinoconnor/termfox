@@ -47,14 +47,25 @@ function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents
       if (!t || t === this._sel) { return; }
       if (this._sel) { this._sel.selected = false; }
       this._sel = t; t.selected = true;
+      this._switching = t;
       emit(tcListeners, "TabSelect", t);
       setTimeout(() => {
         if (this._sel === t) {
+          this._switching = null;
+          this._switched = switchEvents.includes("TabSwitchDone") ? null : t; // finish() destroys the switcher
           for (const type of switchEvents) { emit(winListeners, type, win, type === "TabSwitched" ? { tab: t } : undefined); }
         }
       }, switchDelay);
     },
     get selectedBrowser() { return this._sel?.linkedBrowser; },
+    // AsyncTabSwitcher: alive from the selection until finish(); a test can replace it.
+    _switching: null, _switched: null, _switcherOverride: undefined,
+    get _switcher() {
+      if (this._switcherOverride !== undefined) { return this._switcherOverride; }
+      const t = this._switching || this._switched;
+      return t ? { requestedTab: t, switchInProgress: !!this._switching, STATE_LOADED: 1, getTabState: () => (this._switching ? 0 : 1) } : null;
+    },
+    set _switcher(v) { this._switcherOverride = v; },
     get visibleTabs() { return this.tabs.filter(t => !t.hidden && !t.closing); },
     tabContainer: { addEventListener(t, f) { (tcListeners[t] ||= []).push(f); } },
     tabpanels: el("tabpanels"),
@@ -64,7 +75,7 @@ function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents
         successor: null, linkedPanel: tabDelay ? null : `panel${n}`,
         linkedBrowser: { browserId: n, currentURI: { host: label ? `${label}.example.com` : "" }, focus() {}, docShellIsActive: false } };
       this.tabs.push(tab);
-      if (tabDelay) { setTimeout(() => { tab.linkedPanel = `panel${n}`; }, tabDelay); }
+      if (tabDelay) { setTimeout(() => { tab.linkedPanel = `panel${n}`; emit(tcListeners, "TabBrowserInserted", tab); }, tabDelay); }
       emit(tcListeners, "TabOpen", tab);
       return tab;
     },
@@ -96,7 +107,7 @@ function fakeFirefox({ saved = null, tabDelay = 0, switchDelay = 1, switchEvents
   };
   const win = {
     document: doc, gBrowser: gb, SessionStore, FirefoxViewHandler: { tab: null }, BROWSER_NEW_TAB_URL: "about:newtab",
-    gURLBar: { select() {} }, focus() {}, setTimeout, clearTimeout,
+    gURLBar: { select() {} }, focus() {}, setTimeout, clearTimeout, performance,
     addEventListener(t, f) { (winListeners[t] ||= []).push(f); },
     UC_API: { Windows: { waitWindowLoading: async () => {} }, Notifications: { show: async () => {} } },
   };
@@ -139,10 +150,10 @@ async function boot(opts) {
   return { ...ff, T, run, visible, status: () => T.statusText() };
 }
 
-const silence = fn => async () => {
+const silence = fn => async (...args) => {
   const l = console.log; const e = console.error; const w = console.warn;
   console.log = console.error = console.warn = () => {};
-  try { await fn(); } finally { console.log = l; console.error = e; console.warn = w; }
+  try { await fn(...args); } finally { console.log = l; console.error = e; console.warn = w; }
 };
 
 test("c / l / n / p / digits switch windows by hiding tabs, no reloads", silence(async () => {
@@ -271,9 +282,10 @@ async function settled(T) {
   }
   throw new Error("queue never drained");
 }
-function keyEvent(key, mods, target, { repeat = false } = {}) {
-  const e = { key, code: "Key" + key.toUpperCase(), ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, ...mods,
-    repeat, target, composedTarget: target, prevented: false, isComposing: false };
+function keyEvent(key, mods, target, { repeat = false, timeStamp = performance.now() } = {}) {
+  const code = key.startsWith("Arrow") ? key : "Key" + key.toUpperCase();
+  const e = { key, code, ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, ...mods,
+    repeat, target, composedTarget: target, prevented: false, isComposing: false, timeStamp };
   e.preventDefault = () => { e.prevented = true; };
   e.stopPropagation = () => {};
   return e;
@@ -476,3 +488,92 @@ test("split still waits while the switcher is mid-switch, then gives up after sw
   assert.ok(Date.now() - t0 >= 55, "waited for the fallback timeout");
   assert.equal(f.T.paneTabs().length, 2);
 }));
+
+// ---- latency (Ryan 2026-10-08: "feels a bit slow"): keydown -> layout applied -> focus settled
+
+// Alt+H, Alt+Y, then focus moves, each pressed as a real keydown (timeStamp = press time).
+async function pressSequence(f) {
+  const T = f.T;
+  const page = browserEl(f.gb.tabs[0]);
+  const keys = [["h", { altKey: true }], ["y", { altKey: true }], ["ArrowUp", { altKey: true }], ["ArrowDown", { altKey: true }],
+    ["ArrowLeft", { altKey: true }], ["ArrowRight", { altKey: true }]];
+  for (const [k, mods] of keys) {
+    T.onChromeKeydown(keyEvent(k, mods, f.gb.selectedTab.linkedBrowser.localName ? f.gb.selectedTab.linkedBrowser : page));
+    await T.idle();
+  }
+  return [...T.latencies.slice(-keys.length)]; // copy into this realm (T lives in a vm context)
+}
+
+test("latency: splits and focus moves end on tab events (no timeout fallback) within 50 ms of the key", silence(async t => {
+  // switchDelay = how long the fake Firefox takes to finish a tab switch (TabSwitched).
+  for (const switchDelay of [0, 8, 16, 30]) {
+    const f = await boot({ switchDelay, switchEvents: ["TabSwitched"] });
+    const timings = await pressSequence(f);
+    assert.deepEqual(timings.map(x => x.action), ["split-col", "split-row", "focus-up", "focus-down", "focus-left", "focus-right"]);
+    for (const x of timings) {
+      assert.deepEqual([...x.fallbacks], [], x.describe());
+      assert.ok(x.layout != null && x.switch != null && x.layout <= x.switch && x.switch <= x.total, x.describe());
+      // tilefox's own share: key -> panes moved, plus switch event -> done. The rest is the
+      // (fake) Firefox tab switch, whose node timer can run late when the machine is busy.
+      const own = x.layout + (x.total - x.switch);
+      assert.ok(own < 20, `tilefox overhead ${own.toFixed(1)} ms: ${x.describe()}`);
+    }
+    t.diagnostic(`switch ${switchDelay} ms: ` + timings.map(x =>
+      `${x.action} ${x.total.toFixed(1)} (layout ${x.layout.toFixed(1)}, switch event ${x.switch.toFixed(1)})`).join(", "));
+  }
+}));
+
+test("latency: no polling or fixed-delay timers in the split / focus hot path", silence(async () => {
+  const f = await boot({ switchDelay: 10, tabDelay: 5, switchEvents: ["TabSwitched"] });
+  const timers = [];
+  const real = f.win.setTimeout;
+  f.win.setTimeout = (fn, ms) => { timers.push(ms); return real(fn, ms); };
+  await pressSequence(f);
+  // Allowed: the queue's stuck-job guard (4000), the switch fallback (switchWaitMs) and the
+  // SessionStore write debounce (150), none of which an action waits on unless something is stuck.
+  const short = timers.filter(ms => !(ms >= 150));
+  assert.deepEqual(short, [], `short timers scheduled: ${timers.join(", ")}`);
+  assert.ok(f.T.latencies.slice(-6).every(x => !x.fallbacks.length));
+}));
+
+test("latency: a content-routed key counts from the page's keydown, and a stalled switch is flagged", silence(async () => {
+  const f = await boot({ switchDelay: 5, switchEvents: ["TabSwitched"] });
+  const T = f.T;
+  const page = browserEl(f.gb.tabs[0]);
+  T.onActorHello(page, {});
+  const pressed = T.now() - 12; // the content process saw the key 12 ms ago
+  T.onChromeKeydown(keyEvent("h", { ctrlKey: true }, page));
+  T.onActorAction({ action: "split-col", via: "content", t: pressed }, page);
+  await settled(T);
+  const x = T.latencies.at(-1);
+  assert.equal(x.action, "split-col");
+  assert.ok(x.total >= 12, x.describe());
+  // a timestamp from the future (clock skew) is clamped to now
+  T.onChromeKeydown(keyEvent("h", { ctrlKey: true }, f.gb.selectedTab.linkedBrowser));
+  T.onActorAction({ action: "split-col", via: "content", t: T.now() + 60000 }, browserEl(f.gb.selectedTab));
+  await settled(T);
+  assert.ok(T.latencies.at(-1).total < 50, T.latencies.at(-1).describe());
+
+  // Firefox never reports the switch done: the fallback timeout ends the wait and is flagged.
+  const g = await boot({ switchDelay: 5, switchEvents: [] });
+  g.gb._switcher = { requestedTab: null, switchInProgress: true, STATE_LOADED: 1, getTabState: () => 0 };
+  g.T.switchWaitMs = 40;
+  await g.T.runAction("split-row", "test");
+  const stalled = g.T.latencies.at(-1);
+  assert.deepEqual([...stalled.fallbacks], ["tab switch"]);
+  assert.ok(stalled.slow);
+  assert.match(stalled.describe(), /^split-row done in \d+ ms: layout applied \d+ ms, focus settled \d+ ms \(queue wait \d+ ms, tab switch \d+ ms, via test\) - FALLBACK TIMEOUT HIT: tab switch$/);
+}));
+
+test("ActionTiming formats the log line and flags slow actions", () => {
+  let now = 1000;
+  const x = new Core.ActionTiming("split-col", "keydown", 1000, () => now);
+  now = 1002; x.mark("layout");
+  now = 1035; x.mark("switch");
+  now = 1037; x.mark("focus");
+  assert.equal(x.describe(), "split-col done in 37 ms: layout applied 2 ms, focus settled 37 ms (queue wait 0 ms, tab switch 35 ms, via keydown)");
+  assert.ok(!x.slow);
+  now = 1080; x.mark("focus");
+  assert.ok(x.slow);
+  assert.match(x.describe(), /over the 50 ms target$/);
+});

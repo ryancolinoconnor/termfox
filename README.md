@@ -79,6 +79,15 @@ registration and the actor registration. Every key press that matches the keymap
 (taken, passed through and why, or deferred to the page), and content actors log their typing checks through the
 parent. Prefix keys and reloads are logged too.
 
+Every action logs its latency, measured from the key press (the keydown's own timestamp; for keys the page
+decides, the content process's timestamp):
+`split-col done in 37 ms: layout applied 1 ms, focus settled 37 ms (queue wait 0 ms, tab switch 36 ms, via keydown)`.
+"Layout applied" is when the pane styles are set; "next frame N ms after the key" (a second line) is when that
+layout goes to the screen. "Focus settled" is when Firefox reports the tab switch done (TabSwitched or the switcher's
+state) and focus has moved. Over 50 ms the line is a WARN; `FALLBACK TIMEOUT HIT` means a wait ran out (1.5 s)
+instead of ending on a Firefox event. No step polls or sleeps: the waits end on tab events. The last 50 timings are
+in `Tilefox.latencies` (Browser Console, in a window's context).
+
 ## Install (Windows)
 
 1. Close all Firefox windows.

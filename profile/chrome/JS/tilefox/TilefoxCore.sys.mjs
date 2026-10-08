@@ -387,6 +387,71 @@ export class ActionQueue {
   }
 }
 
+// ---------------------------------------------------------------- action latency
+
+/** A split or focus move should feel instant: slower actions are logged as warnings. */
+export const LATENCY_TARGET_MS = 50;
+
+/**
+ * Times one action from its key press (t0, epoch ms). Marks are ms after t0:
+ *   start  the queue ran it (earlier actions finish first)
+ *   layout the first apply() during the action (pane styles set; painted on the next frame)
+ *   switch the tab switch to the new pane finished (TabSwitched / switcher state)
+ *   focus  the action is done: focus moved and everything settled
+ * fallbacks: waits that ran out (switchWaitMs) instead of ending on an event.
+ */
+export class ActionTiming {
+  constructor(action, via, t0, now = () => Date.now()) {
+    this.action = action;
+    this.via = via;
+    this.t0 = t0;
+    this.now = now;
+    this.start = this.since();
+    this.layout = null;
+    this.switch = null;
+    this.focus = null;
+    this.fallbacks = [];
+  }
+
+  since() {
+    return Math.max(0, this.now() - this.t0);
+  }
+
+  mark(name) {
+    this[name] = this.since();
+  }
+
+  fallback(what) {
+    this.fallbacks.push(what);
+  }
+
+  get total() {
+    return this.focus ?? this.since();
+  }
+
+  get slow() {
+    return this.total > LATENCY_TARGET_MS || this.fallbacks.length > 0;
+  }
+
+  /** "split-col done in 37 ms: layout applied 2 ms, focus settled 37 ms (queue wait 0 ms, tab switch 35 ms, via keydown)" */
+  describe() {
+    const ms = v => `${Math.round(v)} ms`;
+    const parts = [`layout applied ${this.layout == null ? "-" : ms(this.layout)}`, `focus settled ${ms(this.total)}`];
+    const extra = [`queue wait ${ms(this.start)}`];
+    if (this.switch != null) {
+      extra.push(`tab switch ${ms(this.switch)}`);
+    }
+    extra.push(`via ${this.via}`);
+    let line = `${this.action} done in ${ms(this.total)}: ${parts.join(", ")} (${extra.join(", ")})`;
+    if (this.fallbacks.length) {
+      line += ` - FALLBACK TIMEOUT HIT: ${this.fallbacks.join(", ")}`;
+    } else if (this.total > LATENCY_TARGET_MS) {
+      line += ` - over the ${LATENCY_TARGET_MS} ms target`;
+    }
+    return line;
+  }
+}
+
 // ---------------------------------------------------------------- layout geometry
 
 /** Layout tree ({tab} leaf | {dir:"row"|"col", a, b, ratio}) -> Map(tab -> {x,y,w,h} in %). */

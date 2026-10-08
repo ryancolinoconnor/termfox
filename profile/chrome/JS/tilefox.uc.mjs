@@ -105,7 +105,10 @@ class TilefoxWindow {
       setTimer: (f, ms) => this.win.setTimeout(f, ms),
       clearTimer: id => this.win.clearTimeout(id),
     });
-    this.switchWaitMs = 1500; // longest wait for a tab switch to finish before moving on
+    this.switchWaitMs = 1500; // fallback only: longest wait for a tab switch (logged as a miss if hit)
+    this.waiters = new Set(); // waitFor() checks, re-run on every tab / tab-switch event
+    this.timing = null; // the running action's Core.ActionTiming
+    this.latencies = []; // last 50 finished timings (debugging: Tilefox.latencies in the Browser Console)
     this.actorBrowsers = new WeakSet(); // browsers whose content actor has said hello
     this.paintPath = "none";
     this.loadKeyMap();
@@ -162,11 +165,13 @@ class TilefoxWindow {
     for (const tab of this.gBrowser.tabs) {
       this.adopt(tab);
     }
-    this._onSelect = () => this.safe(() => this.onTabSelect());
+    this._onSelect = () => this.safe(() => { this.onTabSelect(); this.wake(); });
     this._onClose = e => this.safe(() => this.onTabClose(e.target));
     tc.addEventListener("TabSelect", this._onSelect);
     tc.addEventListener("TabClose", this._onClose);
     tc.addEventListener("TabOpen", e => this.safe(() => this.onTabOpen(e.target)));
+    // A tab's <browser> and panel exist (Tabbrowser._insertBrowser): wakes settle()'s panel wait.
+    tc.addEventListener("TabBrowserInserted", () => this.safe(() => this.wake()));
     tc.addEventListener("TabPinned", () => this.safe(() => this.applyVisibility()));
     tc.addEventListener("TabUnpinned", () => this.safe(() => this.applyVisibility()));
     tc.addEventListener("TabAttrModified", e => {
@@ -333,13 +338,55 @@ class TilefoxWindow {
   // ---------------------------------------------------------------- actions
   // Every action goes through one queue: a split finishes (tab exists, layout applied, tab
   // switch done) before the next split, close or focus move starts. Returns the job's promise.
-  runAction(action, via) {
+  // t0: when the key was pressed (epoch ms, see now()); defaults to now.
+  runAction(action, via, t0 = this.now()) {
     if (action === "kill") {
       LOG("action kill via", via);
       return Promise.resolve(this.safe(() => this.toggleKillSwitch())); // never waits behind a stuck job
     }
     LOG("action", action, "via", via, this.queue.pending ? `(queued behind ${this.queue.pending})` : "");
-    return this.queue.push(action, () => this.doAction(action, via));
+    return this.queue.push(action, () => this.timed(action, via, t0));
+  }
+
+  // Runs one action and logs "split-col done in 37 ms: layout applied 2 ms, focus settled 37 ms ...",
+  // all measured from the key press. Over Core.LATENCY_TARGET_MS or any fallback hit -> warning.
+  async timed(action, via, t0) {
+    const t = new Core.ActionTiming(action, via, t0, () => this.now());
+    this.timing = t;
+    try {
+      await this.doAction(action, via);
+    } finally {
+      if (this.timing === t) {
+        this.timing = null;
+      }
+      t.mark("focus");
+      this.latencies.push(t);
+      if (this.latencies.length > 50) {
+        this.latencies.shift();
+      }
+      (t.slow ? logger.warn : logger.log).call(logger, t.describe());
+      // The layout reaches the screen on the next refresh tick; log when that frame starts.
+      // Off the hot path: the queue has already moved on.
+      if (t.layout != null && typeof this.win.requestAnimationFrame === "function") {
+        this.win.requestAnimationFrame(() => LOG(`${action}: next frame ${Math.round(this.now() - t0)} ms after the key`));
+      }
+    }
+  }
+
+  // Epoch ms with sub-ms precision, comparable across processes (the content actor sends the
+  // same clock). Falls back to Date.now() when the window has no performance object.
+  now() {
+    const p = this.win.performance;
+    return p && p.timeOrigin ? p.timeOrigin + p.now() : Date.now();
+  }
+
+  // When a key event happened, from its timeStamp (ms since this window's timeOrigin), so the
+  // time before our listener ran is counted too. Implausible values fall back to now().
+  eventTime(e) {
+    const p = this.win.performance;
+    const now = this.now();
+    const t = p && p.timeOrigin && e?.timeStamp > 0 ? p.timeOrigin + e.timeStamp : now;
+    return t <= now && now - t < 10000 ? t : now;
   }
 
   idle() {
@@ -399,7 +446,10 @@ class TilefoxWindow {
       return;
     }
     LOG(`actor action ${data.action} from browser ${id}: ${r.why}`);
-    this.runAction(data.action, data.via);
+    // data.t: the content keydown's time (same epoch clock as now()); clamped against skew.
+    const now = this.now();
+    const t0 = typeof data.t === "number" && data.t <= now && now - data.t < 10000 ? data.t : now;
+    this.runAction(data.action, data.via, t0);
   }
 
   onActorHello(browser, data) {
@@ -653,6 +703,7 @@ class TilefoxWindow {
       return;
     }
     const prev = this.ws.current;
+    const before = gb.selectedTab;
     this.switching = true;
     let target;
     try {
@@ -694,36 +745,45 @@ class TilefoxWindow {
     }
     this.apply();
     LOG(`window ${prev === id ? "stays" : "->"} ${w.index}:${this.nameOf(w)} (${this.tabsOf(id).length} tab(s)); ${this.statusText()}`);
-    this.win.setTimeout(() => this.safe(() => {
+    // Focus once the tab switch is done (an event, not a timer); at once if the tab didn't change.
+    const focus = () => this.safe(() => {
+      if (gb.selectedTab !== target) {
+        return;
+      }
       if (newTab) {
         this.win.gURLBar?.select();
       } else {
         gb.selectedBrowser?.focus();
       }
-    }), 0);
+    });
+    if (target === before) {
+      focus();
+      return undefined;
+    }
+    return this.settle(target, "window").then(focus);
   }
 
   newWindow() {
     const w = this.ws.add();
     LOG(`new window ${w.index}`);
-    this.selectWindow(w.id, { newTab: true });
+    return this.selectWindow(w.id, { newTab: true });
   }
 
   lastWindow() {
     if (!this.ws.get(this.ws.last)) {
       this.toast("no last window");
-      return;
+      return undefined;
     }
-    this.selectWindow(this.ws.last);
+    return this.selectWindow(this.ws.last);
   }
 
   selectIndex(i) {
     const w = this.ws.byIndex(i);
     if (!w) {
       this.toast(`can't find window: ${i}`); // tmux's message
-      return;
+      return undefined;
     }
-    this.selectWindow(w.id);
+    return this.selectWindow(w.id);
   }
 
   renameWindow(name) {
@@ -909,35 +969,50 @@ class TilefoxWindow {
   }
 
   // Resolves once `tab` has its panel, the tab switch to it is done (switchShown) and the
-  // layout is applied again. Each wait gives up after switchWaitMs, logging which step stalled.
+  // layout is applied again. Each wait gives up after switchWaitMs, logging which step stalled;
+  // that fallback should never fire, and the action's timing line flags it if it does.
   async settle(tab, why) {
     const gb = this.gBrowser;
-    if (!(await this.until(() => tab.closing || (tab.linkedPanel && tab.linkedBrowser)))) {
+    if (!(await this.waitFor(() => tab.closing || (tab.linkedPanel && tab.linkedBrowser)))) {
+      this.timing?.fallback("panel");
       LOG(`${why}: new tab still has no panel after ${this.switchWaitMs} ms; continuing`);
     }
     if (gb.selectedTab === tab && !tab.closing && !(await this.switchDone(tab))) {
+      this.timing?.fallback("tab switch");
       LOG(`${why}: tab switch not finished (no TabSwitched) after ${this.switchWaitMs} ms; continuing`);
     }
+    this.timing?.mark("switch");
     this.apply();
   }
 
-  until(cond) {
+  // Resolves true as soon as cond() holds. No polling: cond is re-checked on every tab event
+  // that can change it (wake(): TabSwitched, TabSwitchDone, TabSelect, TabBrowserInserted,
+  // TabClose). Resolves false after switchWaitMs if none of them made it true.
+  waitFor(cond) {
     if (cond()) {
       return Promise.resolve(true);
     }
     return new Promise(resolve => {
-      const start = Date.now();
-      const poll = () => {
+      let timer = null;
+      const finish = ok => {
+        this.waiters.delete(check);
+        this.win.clearTimeout(timer);
+        resolve(ok);
+      };
+      const check = () => {
         if (cond()) {
-          resolve(true);
-        } else if (Date.now() - start >= this.switchWaitMs) {
-          resolve(false);
-        } else {
-          this.win.setTimeout(poll, 10);
+          finish(true);
         }
       };
-      this.win.setTimeout(poll, 10);
+      this.waiters.add(check);
+      timer = this.win.setTimeout(() => finish(!!cond()), this.switchWaitMs);
     });
+  }
+
+  wake() {
+    for (const check of [...this.waiters]) {
+      this.safe(check);
+    }
   }
 
   // Is the switch to `tab` finished? Firefox 157 AsyncTabSwitcher dispatches "TabSwitched"
@@ -965,19 +1040,22 @@ class TilefoxWindow {
       && (typeof sw.getTabState !== "function" || sw.getTabState(tab) === sw.STATE_LOADED);
   }
 
+  // Also ends when another tab gets selected meanwhile: there is nothing left to wait for.
   switchDone(tab) {
-    return this.until(() => this.switchShown(tab));
+    return this.waitFor(() => this.gBrowser.selectedTab !== tab || tab.closing || this.switchShown(tab));
   }
 
   onSwitched(tab) {
     if (tab && tab === this.gBrowser.selectedTab) {
       this.switchedTo = tab;
     }
+    this.wake();
   }
 
   onSwitchDone() {
     this.switchedTo = this.gBrowser.selectedTab;
     this.activatePaneBrowsers();
+    this.wake();
   }
 
   unpane(tab) {
@@ -1033,6 +1111,7 @@ class TilefoxWindow {
         this.win.setTimeout(() => this.safe(() => this.selectWindow(next)), 0);
       }
     }
+    this.wake(); // a wait on this tab ends (cond checks tab.closing)
     // Defer: the closing tab's replacement selection happens after TabClose.
     this.win.setTimeout(() => this.safe(() => this.apply()), 0);
   }
@@ -1090,6 +1169,9 @@ class TilefoxWindow {
     this.publishPaneIds();
     if (visible) {
       this.activatePaneBrowsers();
+    }
+    if (this.timing && this.timing.layout == null) {
+      this.timing.mark("layout"); // the first apply() of the action is when the panes move
     }
     this.guardLastTab();
     this.updateStatus();
@@ -1192,7 +1274,7 @@ class TilefoxWindow {
         return decide(`swallowed (key repeat; ${why})`);
       }
       decide(`${b.action} (${why})`);
-      this.runAction(b.action, via);
+      this.runAction(b.action, via, this.eventTime(e));
     };
 
     if (b.action === "kill") {
