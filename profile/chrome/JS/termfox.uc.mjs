@@ -58,12 +58,20 @@
  *   hello; otherwise, and for chrome focus, decided here. Their Firefox <key>s stay enabled, so
  *   a passed-through key still does its normal job (redo, history, select all, word-jump); a
  *   taken key is preventDefault()ed, which stops the XUL <key> from firing.
+ * - Alt+Enter (and prefix b) collapses the whole top bar: the root gets [termfox-chrome-collapsed]
+ *   and termfox.uc.css moves #navigator-toolbox out of the flow and above the window (it stays
+ *   rendered, so the URL bar can still take focus). Focus entering the toolbox (Ctrl+L, F6, Alt+D),
+ *   or the mouse at the very top edge, sets [termfox-chrome-peek], which slides it back over the
+ *   panes until focus and the mouse leave it. Not fullscreen mode. Saved per window in SessionStore
+ *   ("termfox-chrome"), default for new windows in termfox.chromeCollapsed. Paused = always shown.
  */
 
 const Core = ChromeUtils.importESModule("chrome://userscripts/content/termfox/TermfoxCore.sys.mjs");
 const PREF_ENABLED = "termfox.enabled";
 const PREF_STATUSBAR = "termfox.statusbar";
 const PREF_KEYS_BRANCH = Core.KEY_PREF_BRANCH;
+const ATTR_COLLAPSED = "termfox-chrome-collapsed";
+const ATTR_PEEK = "termfox-chrome-peek";
 const logger = Core.getLogger();
 
 // Private browsing (security audit M2): a private window never writes to the disk log, never
@@ -101,8 +109,9 @@ const STYLE_FILE = "termfox.uc.css";
 //   Ctrl+Shift+P    key_privatebrowsing (new private window)
 // "Pass when typing" keys (Ctrl+Y redo, Ctrl+H history, Ctrl+A select all) are NOT disabled, so
 // they keep working when termfox passes them through.
+// Alt+Enter (urlbar: "pass") disables nothing: the URL bar's own Alt+Enter must keep working.
 function overriddenKeys(keyMap) {
-  return keyMap.bindings.filter(b => b.typing === "take" && b.action !== "kill").map(b => Core.comboToOriginalKey(b.combo));
+  return keyMap.bindings.filter(b => b.typing === "take" && b.action !== "kill" && b.urlbar !== "pass").map(b => Core.comboToOriginalKey(b.combo));
 }
 
 class TermfoxWindow {
@@ -137,6 +146,9 @@ class TermfoxWindow {
     this.panel = null;
     this.paletteItems = [];
     this.paletteIndex = 0;
+    // Collapsed top bar: this window's choice (SessionStore restores it), else the pref default.
+    this.chromeCollapsed = Services.prefs.getBoolPref(Core.PREF_CHROME_COLLAPSED, false);
+    this.peeking = false;
   }
 
   // false = paused (termfox.enabled; the UI calls it pause/resume). Paused, termfox only
@@ -183,6 +195,8 @@ class TermfoxWindow {
     this.buildPanel();
 
     this.buildStatusBar();
+    this.buildPeek();
+    this.applyChrome();
     logger.setOnWriteError((e, path) => this.notify(`termfox: cannot write ${path} (${e?.message || e}). Details in the Browser Console (Ctrl+Shift+J).`));
 
     const tc = this.gBrowser.tabContainer;
@@ -263,8 +277,9 @@ class TermfoxWindow {
       return;
     }
     // Only "always" keys: a reserved <key> would fire before content could pass a key through.
+    // Not Alt+Enter either: a reserved <key> would also fire in the URL bar, where it must pass.
     const defs = this.keyMap.bindings
-      .filter(b => b.typing === "take")
+      .filter(b => b.typing === "take" && b.urlbar !== "pass")
       .map(b => ({ id: b.action === "kill" ? "termfox-kill" : `termfox-${b.id}`, combo: b.combo, action: b.action }));
     for (const d of defs) {
       const hk = Core.comboToHotkey(d.combo);
@@ -453,6 +468,7 @@ class TermfoxWindow {
       case "rename-window": return this.openPanel("rename");
       case "kill-window": return this.openPanel("confirm");
       case "clear-log": return this.clearLog();
+      case "toggle-chrome": return this.toggleChrome();
     }
     if (action.startsWith("select-window-")) {
       return this.selectIndex(Number(action.slice(14)));
@@ -566,6 +582,7 @@ class TermfoxWindow {
     }
     // Disabled: every tab is shown. Enabled again: only the current window's tabs.
     this.applyVisibility();
+    this.applyChrome(); // paused: the top bar always shows
     this.updateStatus();
     this.applyKeyState();
   }
@@ -724,6 +741,14 @@ class TermfoxWindow {
       this.ws.select(selOwner);
     }
     this.restored = true;
+    let savedChrome = "";
+    try {
+      savedChrome = SS.getCustomWindowValue(this.win, Core.CHROME_VALUE) || "";
+    } catch (e) {}
+    if (savedChrome) {
+      this.chromeCollapsed = Core.chromeCollapsedFrom(savedChrome, this.chromeCollapsed);
+      this.applyChrome();
+    }
     for (const tab of this.liveTabs()) {
       this.writeTabValue(tab);
     }
@@ -765,9 +790,103 @@ class TermfoxWindow {
     }
     try {
       this.win.SessionStore.setCustomWindowValue(this.win, Core.WINDOWS_VALUE, JSON.stringify(this.ws.toJSON(t => this.uidOf(t))));
+      this.win.SessionStore.setCustomWindowValue(this.win, Core.CHROME_VALUE, this.chromeCollapsed ? "1" : "0");
     } catch (e) {
       ERR("windows: setCustomWindowValue failed", e);
     }
+  }
+
+  // ---------------------------------------------------------------- collapsed top bar
+  // Alt+Enter / prefix b. One synchronous attribute flip, then the pane layout re-applies in the
+  // same task, so the panes take the new height on the next frame (no transition, no reflow loop).
+  toggleChrome() {
+    this.chromeCollapsed = !this.chromeCollapsed;
+    this.setPeek(false);
+    this.applyChrome();
+    Services.prefs.setBoolPref(Core.PREF_CHROME_COLLAPSED, this.chromeCollapsed); // new windows follow
+    this.writeChromeValue();
+    if (this.chromeCollapsed && this.inToolbox(this.doc.activeElement)) {
+      this.gBrowser.selectedBrowser?.focus(); // don't leave focus in a bar that just went away
+    }
+    this.apply();
+    LOG(`top bar ${this.chromeCollapsed ? "collapsed" : "shown"}`);
+  }
+
+  chromeHidden() {
+    return this.enabled && this.chromeCollapsed;
+  }
+
+  applyChrome() {
+    const root = this.doc.documentElement;
+    const hidden = this.chromeHidden();
+    root?.toggleAttribute(ATTR_COLLAPSED, hidden);
+    if (!hidden) {
+      this.setPeek(false);
+    }
+  }
+
+  // Written right away (not after restore): SessionStore keeps the latest value. Private windows
+  // keep it in memory only, like their termfox windows.
+  writeChromeValue() {
+    if (this.unloading || this.private) {
+      return;
+    }
+    try {
+      this.win.SessionStore?.setCustomWindowValue(this.win, Core.CHROME_VALUE, this.chromeCollapsed ? "1" : "0");
+    } catch (e) {
+      ERR("top bar: setCustomWindowValue failed", e);
+    }
+  }
+
+  setPeek(on) {
+    on = !!on && this.chromeHidden();
+    if (on === this.peeking) {
+      return;
+    }
+    this.peeking = on;
+    this.doc.documentElement?.toggleAttribute(ATTR_PEEK, on);
+  }
+
+  inToolbox(el) {
+    const tb = this.doc.getElementById("navigator-toolbox");
+    try {
+      return !!el && !!tb && typeof tb.contains === "function" && tb.contains(el);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Peek: a 3 px strip at the top edge (mouse), focus entering the toolbox (Ctrl+L / F6 / Alt+D,
+  // a toolbar button), or one of those keys (Core.isPeekKey, before Firefox moves focus).
+  buildPeek() {
+    const zone = this.doc.createElementNS("http://www.w3.org/1999/xhtml", "div");
+    zone.id = "termfox-peek-zone";
+    (this.doc.body || this.doc.documentElement)?.append(zone);
+    this.peekZone = zone;
+    const tb = this.doc.getElementById("navigator-toolbox");
+    zone.addEventListener("mouseenter", () => this.safe(() => this.setPeek(true)));
+    tb?.addEventListener("focusin", () => this.safe(() => this.setPeek(true)));
+    tb?.addEventListener("focusout", () => this.unpeekSoon());
+    tb?.addEventListener("mouseleave", () => this.unpeekSoon());
+    this.win.addEventListener("popuphidden", () => this.unpeekSoon());
+  }
+
+  // Hide again once focus has left the toolbox, the mouse is off it and none of its menus,
+  // panels or URL-bar results is open. Re-checked on focusout / mouseleave / popuphidden.
+  unpeekSoon(ms = 150) {
+    if (!this.peeking) {
+      return;
+    }
+    this.win.clearTimeout(this.peekTimer);
+    this.peekTimer = this.win.setTimeout(() => this.safe(() => {
+      const tb = this.doc.getElementById("navigator-toolbox");
+      const hovered = el => { try { return !!el?.matches?.(":hover"); } catch (e) { return false; } };
+      const focused = this.inToolbox(this.doc.activeElement);
+      const open = !!tb?.querySelector?.("[open]:not([open='false'])");
+      if (!focused && !open && !hovered(tb) && !hovered(this.peekZone)) {
+        this.setPeek(false);
+      }
+    }), ms);
   }
 
   // Show the current window's tabs (and pinned ones), hide the rest. Disabled: show everything.
@@ -1345,7 +1464,16 @@ class TermfoxWindow {
   // before the event is forwarded to web content.
   onChromeKeydown(e) {
     // Synthetic (untrusted) events never drive termfox.
-    if (!e.isTrusted || (!e.ctrlKey && !e.altKey)) {
+    if (!e.isTrusted) {
+      return;
+    }
+    if (this.chromeHidden() && Core.isPeekKey(e)) {
+      // Reveal before Firefox focuses the URL bar; focusin keeps it shown, unpeekSoon hides it
+      // again if focus never arrived. The key itself goes on to Firefox.
+      this.setPeek(true);
+      this.unpeekSoon(400);
+    }
+    if (!e.ctrlKey && !e.altKey) {
       return;
     }
     const b = Core.bindingFor(this.keyMap, e);
@@ -1381,6 +1509,7 @@ class TermfoxWindow {
     }
     const chromeEditable = !browser && this.chromeEditable(t);
     const { verdict, why } = Core.routeChromeKey(b, {
+      inUrlBar: !browser && this.inUrlBar(t),
       inContent: !!browser,
       actorAlive: !!browser && this.actorBrowsers.has(browser),
       chromeEditable,
@@ -1399,6 +1528,12 @@ class TermfoxWindow {
   chromeFieldEmpty() {
     const el = this.doc.activeElement?.shadowRoot?.activeElement || this.doc.activeElement;
     return !!el && (el.localName === "input" || el.localName === "textarea") && el.value === "";
+  }
+
+  // URL bar or search bar focused (Alt+Enter = open in a new tab there).
+  inUrlBar(t) {
+    const el = this.doc.activeElement?.shadowRoot?.activeElement || this.doc.activeElement || t;
+    return !!el && (el.id === "urlbar-input" || !!el.closest?.("#urlbar, #searchbar"));
   }
 
   chromeEditable(t) {
@@ -1470,7 +1605,7 @@ class TermfoxWindow {
     const cur = this.ws.get(this.ws.current);
     switch (mode) {
       case "prefix":
-        this.hint.textContent = "termfox  y/h: split  arrows: move  x: unpane  |  c: new window  n/p: next/prev  l: last  0-9  ,: rename  w: windows  &: kill  |  f: palette  r: reload  L: clear log  Esc";
+        this.hint.textContent = "termfox  y/h: split  arrows: move  x: unpane  |  c: new window  n/p: next/prev  l: last  0-9  ,: rename  w: windows  &: kill  |  b: top bar  f: palette  r: reload  L: clear log  Esc";
         break;
       case "rename":
         this.hint.textContent = `(rename-window) ${cur?.index}: Enter to save, empty = automatic name, Esc to cancel`;
@@ -1525,7 +1660,7 @@ class TermfoxWindow {
         this.setMode(inPlace);
         return;
       }
-      this.closePanel(!action || action === "unpane" || action === "reload" || action === "clear-log");
+      this.closePanel(!action || action === "unpane" || action === "reload" || action === "clear-log" || action === "toggle-chrome");
       if (action) {
         this.runAction(action, "prefix");
       }

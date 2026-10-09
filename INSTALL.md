@@ -42,6 +42,7 @@ Double-click `launch-termfox.cmd`. Optional: install **Vimium** from addons.mozi
 | prefix `,` / `w` / `&` | Rename / list / close window |
 | Alt+L, Alt+0–9 | Last window / jump to a window |
 | prefix `f` or Ctrl+Shift+P | Fuzzy palette |
+| Alt+Enter or prefix `b` | Hide / show the top bar (tabs, address bar, bookmarks). Ctrl+L or the mouse at the top edge peeks. In the address bar Alt+Enter still opens in a new tab |
 | prefix `x` | Turn a pane back into a normal tab |
 | prefix `L` (Shift+L) | Delete termfox's log files |
 | Ctrl+Alt+Shift+K | Pause / resume (not an off switch; see below) |

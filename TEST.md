@@ -143,6 +143,18 @@ In each pane (click it first):
 - [ ] `about:config` → `termfox.enabled` = false gives the same result as the key
 - [ ] Total off switch: `about:config` → `userChromeJS.enabled` = false, then restart. Nothing from termfox or the loader runs
 
+## 9b. Collapsed top bar (Alt+Enter), ~5 min
+
+- [ ] With 2+ panes, Alt+Enter on a page: tab strip, nav bar, bookmarks bar and status line vanish in one frame, the panes grow to the full window height, no flicker. Alt+Enter again brings everything back
+- [ ] Windows, tabs in the title bar (default): the minimize / maximize / close buttons go too, and no blank strip is left at the top. Maximized and restored window both
+- [ ] Collapsed: Ctrl+L, F6 and Alt+D each slide the bar in over the panes (panes don't resize) with the URL bar focused; typing a URL + Enter works; clicking into a page hides the bar again
+- [ ] Collapsed: moving the mouse to the very top edge reveals the bar; open the ☰ menu from it and it stays until the menu closes; moving away hides it
+- [ ] Typing in the URL bar, Alt+Enter opens the result in a new tab (Firefox's), the bar does not collapse
+- [ ] Prefix then b toggles it too; Ctrl+Shift+P / prefix f palette works while collapsed
+- [ ] Restart Firefox: a collapsed window comes back collapsed; Ctrl+N opens collapsed too (`termfox.chromeCollapsed` = true)
+- [ ] Ctrl+Alt+Shift+K (pause) shows the bar; resuming collapses it again
+- [ ] F11 fullscreen and a fullscreen video still behave as normal while collapsed
+
 ## 10. Uninstall, ~5 min
 
 - [ ] Close Firefox, run `uninstall.ps1`, and type YES to delete the spike profile

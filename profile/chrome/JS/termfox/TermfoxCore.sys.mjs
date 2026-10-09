@@ -129,6 +129,9 @@ export function normMods(s) {
  *                    that combo are disabled while termfox is enabled.
  *   noActor: what to do with a "pass" key aimed at web content whose content actor never said hello
  *            (so nobody can check editability): "take" (default) or "pass".
+ *   urlbar:  "pass" = an "always" key that still stays native in the URL bar and the search bar
+ *            (Alt+Enter = "open in a new tab" there). It gets no reserved XUL <key> and disables
+ *            no Firefox <key>, so a passed press reaches the field untouched.
  * Every combo can be overridden with the string pref termfox.keys.<id> ("none" unbinds it).
  */
 export const KEYMAP = [
@@ -148,6 +151,9 @@ export const KEYMAP = [
   { id: "prefixAlways",     combo: "Ctrl+Space", action: "prefix",      typing: "take", tmux: "(termfox alias for the prefix)" },
   { id: "palette",          combo: "Ctrl+Shift+P", action: "palette",   typing: "take", tmux: "(termfox only)" },
   { id: "kill",             combo: "Ctrl+Alt+Shift+K", action: "kill",  typing: "take", tmux: "(termfox only)" },
+  // Collapse / expand the whole top bar (tabs, nav bar, bookmarks, status line). Pages rarely use
+  // Alt+Enter; in the URL bar and search bar it is Firefox's "open in a new tab", so it stays there.
+  { id: "toggleChrome",     combo: "Alt+Enter",  action: "toggle-chrome", typing: "take", urlbar: "pass", tmux: "(like toggling tmux's status line; also prefix b)" },
   // Windows (tmux windows inside one Firefox window). No-prefix quick keys; the tmux defaults
   // are on the prefix (PREFIX_KEYS). Alt+digits are free on Windows: Firefox 157 binds tab
   // selection to Alt+1..9 only on Linux (XP_GNOME), elsewhere to Ctrl+1..9 (browser-sets.inc.xhtml).
@@ -159,9 +165,9 @@ export const KEYMAP = [
 // After the prefix (tmux: C-a <key>). Letters match with or without Ctrl still held.
 // Window keys are tmux's defaults (Ryan's tmux.conf doesn't rebind them): c n p l 0-9 , w &.
 // tmux's p is previous-window, so the palette moved to f (tmux find-window).
-// L (Shift+L) deletes termfox's diagnostic log files.
+// L (Shift+L) deletes termfox's diagnostic log files. b collapses / expands the top bar (Alt+Enter).
 export const PREFIX_KEYS = {
-  y: "split-row", h: "split-col", r: "reload", f: "palette", x: "unpane", L: "clear-log",
+  y: "split-row", h: "split-col", r: "reload", f: "palette", x: "unpane", L: "clear-log", b: "toggle-chrome",
   ArrowLeft: "focus-left", ArrowRight: "focus-right", ArrowUp: "focus-up", ArrowDown: "focus-down",
   c: "new-window", n: "next-window", p: "previous-window", l: "last-window",
   ",": "rename-window", w: "choose-window", "&": "kill-window",
@@ -343,9 +349,13 @@ const isFocusAction = a => a.startsWith("focus-");
  *   chromeEditable focus is in a chrome text field (URL bar, search bar, palette input)
  *   chromeFieldEmpty that field holds no text
  *   layoutVisible  a pane layout is on screen
+ *   inUrlBar       focus is in the URL bar or the search bar (bindings with urlbar: "pass")
  * Returns {verdict: "take"|"pass"|"defer", why}. "defer" = let the content actor decide.
  */
 export function routeChromeKey(b, ctx) {
+  if (b.urlbar === "pass" && ctx.inUrlBar) {
+    return { verdict: "pass", why: "native in the URL bar / search bar" };
+  }
   if (b.typing === "take") {
     return { verdict: "take", why: "always-on binding" };
   }
@@ -402,6 +412,37 @@ export function prefixActionFor(ev) {
   return PREFIX_KEYS[ev.key] || PREFIX_KEYS[(ev.key || "").toLowerCase()]
     || (/^Key[A-Z]$/.test(ev.code || "") ? PREFIX_KEYS[ev.code.slice(3).toLowerCase()] : undefined)
     || (/^(Digit|Numpad)[0-9]$/.test(ev.code || "") && !ev.shiftKey ? PREFIX_KEYS[ev.code.slice(-1)] : undefined) || null;
+}
+
+// ---------------------------------------------------------------- collapsed top bar
+
+export const PREF_CHROME_COLLAPSED = "termfox.chromeCollapsed"; // default for new windows
+export const CHROME_VALUE = "termfox-chrome";                   // SessionStore window value: "1" | "0"
+
+/** A window's collapsed state: its saved SessionStore value wins, else the pref default. */
+export function chromeCollapsedFrom(saved, prefDefault) {
+  return saved === "1" ? true : saved === "0" ? false : !!prefDefault;
+}
+
+/**
+ * Keys that focus the URL bar (Ctrl+L, Alt+D, F6) or the search field (Ctrl+K, Ctrl+E): while the
+ * top bar is collapsed they reveal it ("peek") before Firefox moves focus there.
+ */
+export function isPeekKey(ev) {
+  if (!ev || ev.metaKey) {
+    return false;
+  }
+  const k = (ev.key || "").toLowerCase();
+  if (ev.key === "F6") {
+    return !ev.ctrlKey && !ev.altKey;
+  }
+  if (ev.ctrlKey && !ev.altKey && !ev.shiftKey) {
+    return k === "l" || k === "k" || k === "e" || ev.code === "KeyL" || ev.code === "KeyK" || ev.code === "KeyE";
+  }
+  if (ev.altKey && !ev.ctrlKey && !ev.shiftKey) {
+    return k === "d" || ev.code === "KeyD";
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------- one press, one action

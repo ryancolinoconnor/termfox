@@ -747,3 +747,106 @@ test("M5: paused = no key handling, no actions, no logging; the pause key resume
   assert.ok(f.T.ws.ownerOf(added), "a tab opened while paused joins a window on resume");
   assert.equal(f.T.ws.windows.length, 1, "window 0 lost its only tab while paused: gone on resume");
 }));
+
+// ---- collapsed top bar (Alt+Enter / prefix b), 2026-10-08
+const collapsed = f => "termfox-chrome-collapsed" in f.win.document.documentElement.attrs;
+const peeking = f => "termfox-chrome-peek" in f.win.document.documentElement.attrs;
+
+test("top bar: Alt+Enter on a page collapses and expands it, re-applies the layout and logs only action + timing", silence(async () => {
+  let f;
+  const lines = await captureLog(async () => {
+    f = await boot();
+    await f.run("split-row");
+    const page = browserEl(f.gb.selectedTab);
+    const e = keyEvent("Enter", { altKey: true }, page);
+    f.T.onChromeKeydown(e);
+    await settled(f.T);
+    assert.ok(e.prevented, "taken in web content");
+    assert.ok(collapsed(f));
+    assert.equal(f.T.paneTabs().length, 2, "panes kept");
+    assert.equal(f.T.latencies.at(-1).action, "toggle-chrome");
+    assert.notEqual(f.T.latencies.at(-1).layout, null, "pane layout re-applied during the toggle");
+    f.T.onChromeKeydown(keyEvent("Enter", { altKey: true }, page));
+    await settled(f.T);
+    assert.ok(!collapsed(f), "second press expands");
+  });
+  const mine = lines.filter(l => l.includes("toggle-chrome") || l.includes("top bar"));
+  assert.ok(mine.some(l => /toggle-chrome done in \d+ ms/.test(l)), "timing logged");
+  assert.ok(mine.every(l => !/https?:|example\.com|mail/.test(l)), "no hosts or names in the top-bar lines");
+}));
+
+test("top bar: Alt+Enter in the URL bar or search bar stays Firefox's (open in new tab)", silence(async () => {
+  const f = await boot();
+  for (const sel of ["#urlbar", "#searchbar"]) {
+    const field = { localName: "input", id: sel === "#urlbar" ? "urlbar-input" : "", value: "example.com", closest: q => (q.includes(sel) ? {} : null) };
+    f.win.document.activeElement = field;
+    const e = keyEvent("Enter", { altKey: true }, field);
+    f.T.onChromeKeydown(e);
+    await settled(f.T);
+    assert.ok(!e.prevented, `${sel}: passed through`);
+    assert.ok(!collapsed(f), `${sel}: not collapsed`);
+  }
+  // Elsewhere in chrome (a toolbar button) it toggles.
+  f.win.document.activeElement = { localName: "toolbarbutton", closest: () => null };
+  const e = keyEvent("Enter", { altKey: true }, f.win.document.activeElement);
+  f.T.onChromeKeydown(e);
+  await settled(f.T);
+  assert.ok(e.prevented && collapsed(f));
+}));
+
+test("top bar: prefix b toggles; the state survives a simulated restart; the pref is the default for new windows", silence(async () => {
+  const f = await boot();
+  await f.run("toggle-chrome");
+  assert.ok(collapsed(f));
+  assert.equal(f.winValues[Core.CHROME_VALUE], "1", "saved per window in SessionStore");
+  assert.equal(f.prefs.get(Core.PREF_CHROME_COLLAPSED), true, "default for new windows");
+  // Restart: this window comes back collapsed from its SessionStore value.
+  const again = await boot({ saved: f.saved(), userPrefs: { [Core.PREF_CHROME_COLLAPSED]: true } });
+  assert.ok(again.T.chromeCollapsed && collapsed(again));
+  // The per-window value wins over the pref: a window saved expanded stays expanded.
+  const expanded = await boot({ saved: { win: { [Core.CHROME_VALUE]: "0" } }, userPrefs: { [Core.PREF_CHROME_COLLAPSED]: true } });
+  assert.ok(!collapsed(expanded));
+  // A brand-new window (nothing saved) follows the pref.
+  const fresh = await boot({ userPrefs: { [Core.PREF_CHROME_COLLAPSED]: true } });
+  assert.ok(collapsed(fresh));
+  // A private window doesn't write SessionStore.
+  const priv = await boot({ isPrivate: true });
+  await priv.run("toggle-chrome");
+  assert.ok(collapsed(priv));
+  assert.equal(priv.winValues[Core.CHROME_VALUE], undefined);
+}));
+
+test("top bar: pause restores it, resume collapses it again; Alt+Enter is Firefox's while paused", silence(async () => {
+  const f = await boot();
+  await f.run("toggle-chrome");
+  assert.ok(collapsed(f));
+  const pause = async () => { f.T.onChromeKeydown(keyEvent("k", { ctrlKey: true, altKey: true, shiftKey: true }, null)); await f.T.idle(); f.T.onEnabledChanged(); };
+  await pause();
+  assert.ok(!collapsed(f), "paused: bar shown");
+  const e = keyEvent("Enter", { altKey: true }, browserEl(f.gb.selectedTab));
+  f.T.onChromeKeydown(e);
+  assert.ok(!e.prevented && !collapsed(f), "paused: Alt+Enter untouched");
+  await pause();
+  assert.ok(collapsed(f), "resumed: collapsed again (the window's choice is kept)");
+}));
+
+test("top bar: Ctrl+L / F6 / Alt+D peek while collapsed and hide again once focus is elsewhere", silence(async () => {
+  const f = await boot();
+  const page = browserEl(f.gb.selectedTab);
+  f.win.document.activeElement = page;
+  f.T.onChromeKeydown(keyEvent("l", { ctrlKey: true }, page));
+  assert.ok(!peeking(f), "not collapsed: nothing to peek");
+  await f.run("toggle-chrome");
+  for (const [key, mods] of [["l", { ctrlKey: true }], ["F6", {}], ["d", { altKey: true }]]) {
+    const e = keyEvent(key, mods, page);
+    f.T.onChromeKeydown(e);
+    assert.ok(peeking(f), `${key} peeks`);
+    assert.ok(!e.prevented, `${key} still goes to Firefox`);
+    f.T.unpeekSoon(0);
+    await tick();
+    assert.ok(!peeking(f), "focus never reached the toolbox: hidden again");
+  }
+  // The palette opens while collapsed.
+  await f.run("palette");
+  assert.equal(f.T.panel.state, "open");
+}));

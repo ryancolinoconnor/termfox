@@ -38,6 +38,7 @@ test("default key map mirrors tmux.conf", () => {
     "Ctrl+A": "prefix/pass", // prefix C-a, only when not typing
     "Ctrl+Space": "prefix/take", // always-on alias
     "Ctrl+Shift+P": "palette/take",
+    "Alt+Enter": "toggle-chrome/take", // collapse the top bar (native in the URL bar / search bar)
     "Ctrl+Alt+Shift+K": "kill/take",
     "Alt+L": "last-window/take", // quick key for prefix l
     ...Object.fromEntries([0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(n => [`Alt+${n}`, `select-window-${n}/take`])),
@@ -720,4 +721,52 @@ test("M3: content can only spend a trusted press the parent saw, for the same br
   assert.equal(L.content("prefix", 7, "content").run, true, "the actor may take a passed press");
   L.record({ action: "palette", verdict: "take", browserId: null }); // chrome focus, no browser
   assert.equal(L.content("palette", null, "content-fallback").run, false);
+});
+
+// ---- collapsed top bar (Alt+Enter / prefix b), 2026-10-08
+import * as CoreAll from "../profile/chrome/JS/termfox/TermfoxCore.sys.mjs";
+
+test("keymap: Alt+Enter toggles the top bar (always, except URL bar / search bar), rebindable, prefix b alias", () => {
+  const def = KEYMAP.find(d => d.id === "toggleChrome");
+  assert.equal(def.combo, "Alt+Enter");
+  assert.equal(def.action, "toggle-chrome");
+  assert.equal(def.typing, "take");
+  assert.equal(def.urlbar, "pass");
+  assert.equal(keyPref("toggleChrome"), "termfox.keys.toggleChrome");
+  const km = resolveKeyMap(() => "");
+  const ev = { key: "Enter", code: "Enter", altKey: true, ctrlKey: false, shiftKey: false, metaKey: false };
+  assert.equal(actionFor(km, ev), "toggle-chrome");
+  const b = bindingFor(km, ev);
+  assert.equal(routeChromeKey(b, { inContent: true, actorAlive: true }).verdict, "take");
+  assert.equal(routeChromeKey(b, { inContent: true, actorAlive: false }).verdict, "take");
+  assert.equal(routeChromeKey(b, { chromeEditable: true, chromeFieldEmpty: false }).verdict, "take", "palette input etc.");
+  assert.equal(routeChromeKey(b, { chromeEditable: true, inUrlBar: true }).verdict, "pass");
+  assert.equal(routeContentKey(b, { editable: true, fieldEmpty: false, isPane: true }).verdict, "take");
+  // Other "always" keys ignore inUrlBar.
+  const altH = bindingFor(km, { key: "h", code: "KeyH", altKey: true });
+  assert.equal(routeChromeKey(altH, { chromeEditable: true, inUrlBar: true }).verdict, "take");
+  const rebound = resolveKeyMap(n => (n === "termfox.keys.toggleChrome" ? "Ctrl+Shift+B" : ""));
+  assert.equal(actionFor(rebound, { key: "B", code: "KeyB", ctrlKey: true, shiftKey: true }), "toggle-chrome");
+  assert.equal(actionFor(rebound, ev), null);
+  assert.equal(actionFor(resolveKeyMap(n => (n === "termfox.keys.toggleChrome" ? "none" : "")), ev), null);
+  assert.equal(prefixActionFor({ key: "b", code: "KeyB" }), "toggle-chrome");
+  assert.ok(CONTENT_ACTIONS.has("toggle-chrome"));
+  assert.ok(validateActorMessage("Termfox:Action", { action: "toggle-chrome", via: "content-fallback", t: 1 }).ok);
+});
+
+test("top bar: saved per-window value wins over the pref default; peek keys", () => {
+  const { chromeCollapsedFrom, isPeekKey } = CoreAll;
+  assert.equal(chromeCollapsedFrom("1", false), true);
+  assert.equal(chromeCollapsedFrom("0", true), false);
+  assert.equal(chromeCollapsedFrom("", true), true);
+  assert.equal(chromeCollapsedFrom(undefined, false), false);
+  const k = (key, mods = {}) => ({ key, code: key.length === 1 ? "Key" + key.toUpperCase() : key, ctrlKey: false, altKey: false, shiftKey: false, metaKey: false, ...mods });
+  assert.ok(isPeekKey(k("l", { ctrlKey: true })));
+  assert.ok(isPeekKey(k("F6")));
+  assert.ok(isPeekKey(k("d", { altKey: true })));
+  assert.ok(isPeekKey(k("k", { ctrlKey: true })));
+  assert.ok(!isPeekKey(k("l")));
+  assert.ok(!isPeekKey(k("F6", { ctrlKey: true })));
+  assert.ok(!isPeekKey(k("l", { ctrlKey: true, shiftKey: true })));
+  assert.ok(!isPeekKey(k("d", { ctrlKey: true })));
 });

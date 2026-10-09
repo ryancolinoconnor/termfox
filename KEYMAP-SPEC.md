@@ -12,6 +12,7 @@ Source: `~/.tmux.conf`. Where a key is bound twice, the last binding wins.
 | Alt+Left/Right/Up/Down | select-pane L/R/U/D | focus the pane in that direction (wrapping, as above), ALWAYS. Suppresses Firefox's Alt+Left/Right Back/Forward; use Vimium H/L or the toolbar for those |
 | Prefix | C-a | Ctrl+A acts as the prefix only when focus is NOT in an editable field (select-all still works while typing). Ctrl+Space is an always-on alias |
 | prefix r | reload config | reload the termfox scripts and config, then show a brief "Reloaded" toast |
+| Alt+Enter, prefix b | (like toggling `status`) | collapse / expand the whole top bar (tabs, nav bar, bookmarks, status line, title bar buttons). Always, except in the URL bar and search bar, where Alt+Enter stays Firefox's "open in a new tab". Peek while collapsed: Ctrl+L / F6 / Alt+D or mouse at the top edge. Per window (SessionStore), default for new windows `termfox.chromeCollapsed`. Pref `termfox.keys.toggleChrome` |
 | prefix f | find-window | palette (moved from prefix p on 2026-10-08, because tmux's p is previous-window) |
 | mouse on | click a pane to focus it | click a pane to focus it |
 

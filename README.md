@@ -29,6 +29,7 @@ field, editor, URL bar, select or similar, the key goes to the page instead, jus
 | prefix then `f` / `x` | `f` find-window | Palette / unpane (turn the focused pane back into a normal tab). Esc cancels. (`p` is now previous-window, as in tmux.) |
 | prefix then `c` `n` `p` `l` `0`–`9` `,` `w` `&` | tmux defaults | **Windows** (below): new, next, previous, last, select by index, rename, list, kill. |
 | **Alt+L** / **Alt+0…9** | | Last window / select window N, no prefix. |
+| **Alt+Enter** / prefix then `b` | like toggling tmux's `status` | **Collapse / expand the whole top bar** (tab strip, nav bar, bookmarks bar, termfox status line; with tabs in the title bar also the window buttons) so the panes get the full window height. Not fullscreen. In the URL bar and search bar Alt+Enter stays Firefox's "open in a new tab"; everywhere else, web pages included, it is termfox's. While collapsed, Ctrl+L / F6 / Alt+D (or the mouse at the very top edge) reveal the bar over the panes until focus and the mouse leave it. Remembered per window (SessionStore) and as the default for new windows (`termfox.chromeCollapsed`). Pause shows it again. |
 | **Ctrl+Shift+P** | | Fuzzy palette over termfox windows (`window:name`), panes (▣) and tabs in all windows. Replaces "New private window" (use the menu). |
 | **Ctrl+Alt+Shift+K** | | Pause / resume: toggles `termfox.enabled`. Paused: panes dissolve, Firefox's keys come back, logging and actor messages stop. Not an off switch: uninstall for that (SECURITY.md). |
 | mouse | `mouse on` | Click a pane to focus it. |
@@ -61,7 +62,7 @@ click an entry to switch, or set `termfox.statusbar` = false to hide it.
 The table lives in one place (`KEYMAP` in `TermfoxCore.sys.mjs`). Override any entry with a string pref in
 `about:config`, `termfox.keys.<id>`, for example `termfox.keys.splitRight` = `Ctrl+H`, or `none` to unbind it.
 Ids: `splitRight`, `splitDown`, `splitRightAlways`, `splitDownAlways`, `focusLeft|Right|Up|Down`,
-`focusLeftAlways|RightAlways|UpAlways|DownAlways`, `prefix`, `prefixAlways`, `palette`, `kill`, `lastWindow`,
+`focusLeftAlways|RightAlways|UpAlways|DownAlways`, `prefix`, `prefixAlways`, `palette`, `kill`, `toggleChrome`, `lastWindow`,
 `selectWindow0` … `selectWindow9`. The keydown listener
 picks changes up at once (or press prefix then r). Restart for the menu-style `<key>` fallback of the "always"
 keys to follow. Bad values fall back to the default and are logged.
@@ -189,6 +190,10 @@ profile/chrome/CSS/termfox.uc.css                 pane geometry, focus frame, pa
   seen"), Ctrl+Y/H/Arrow there act as if you were not typing, and Ctrl+A passes through. Use Alt+Y/H/arrows.
 - **Pages that use Ctrl+Arrow** themselves on non-editable content (some slide decks, games) lose it while
   that tab is a pane. Only panes are affected.
+- **Collapsed top bar** (Alt+Enter): with Firefox's native title bar (tabs not in the title bar) Windows still
+  draws its own title bar, which CSS can't hide. While collapsed there is no strip to drag the window by:
+  peek (mouse at the top edge) first. A restored window opens with the pref default for a moment, then
+  switches to its saved state when SessionStore finishes restoring.
 - **Ctrl+Space** may be taken by your Windows IME or input-language switcher before Firefox sees it. Use
   Ctrl+A (outside fields) as the prefix, or Ctrl+Shift+P for the palette.
 - **Privileged pages** (`about:preferences`, `about:addons`) inside a pane: Ctrl+Arrow there falls through to
