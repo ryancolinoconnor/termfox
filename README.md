@@ -101,10 +101,13 @@ in `Termfox.latencies` (Browser Console, in a window's context).
    powershell -ExecutionPolicy Bypass -File .\install.ps1
    ```
    It will:
-   - find Firefox Release (or pass `-FirefoxDir "C:\Program Files\Mozilla Firefox"`)
+   - find Firefox Release: per-machine (`C:\Program Files\Mozilla Firefox`), per-user
+     (`%LOCALAPPDATA%\Mozilla Firefox`) or wherever the registry or PATH points. With several, it uses
+     `-FirefoxDir`, else the one on PATH, else your default browser, and prints which one and why
    - download fx-autoconfig at pinned commit `dfdab56` and check every file's SHA-256
-   - ask for **admin once (UAC)** to write exactly two files: `<Firefox>\config.js` and
-     `<Firefox>\defaults\pref\config-prefs.js`. It refuses if a different autoconfig is already there.
+   - write exactly two files: `<Firefox>\config.js` and `<Firefox>\defaults\pref\config-prefs.js`.
+     For a per-user Firefox you can write to, that needs **no admin**; otherwise it asks for **admin once
+     (UAC)** for just these two files. It refuses if a different autoconfig is already there.
    - create a **new** profile `termfox` (`%APPDATA%\Mozilla\Firefox\Profiles\termfox`) and put the
      loader and our scripts in its `chrome\` folder. It touches no other profile.
    - write a manifest to `%LOCALAPPDATA%\termfox\install-manifest.json` for the uninstaller
@@ -116,7 +119,7 @@ The two program-folder files are read by every profile of this Firefox install. 
 scripts for a profile that has `chrome\utils\chrome.manifest`, and only the spike profile has one, but anything
 that can write a profile could add one. It sets `general.config.sandbox_enabled=false` as a default pref for the
 install, which fx-autoconfig needs on Release. Read **SECURITY.md** (trust model, what the scripts can do, why a
-dedicated Firefox install under Program Files is the cautious choice).
+dedicated Firefox install is the cautious choice, and what changes for a per-user Firefox).
 
 ## Uninstall
 
@@ -126,7 +129,7 @@ powershell -ExecutionPolicy Bypass -File .\uninstall.ps1            # asks befor
 powershell -ExecutionPolicy Bypass -File .\uninstall.ps1 -KeepProfile   # remove the mod, keep the profile
 ```
 It removes only what the manifest lists, and program files only if they are byte-identical to what was
-installed. Before editing `profiles.ini` it backs the file up to `%TEMP%`.
+installed. Like the installer, it asks for admin only if you can't write to the Firefox folder yourself. Before editing `profiles.ini` it backs the file up to `%TEMP%`.
 
 ## Updating the scripts (after an edit)
 
@@ -167,6 +170,8 @@ profile/chrome/JS/termfox/TermfoxParent.sys.mjs   forwards actor messages/log li
 profile/chrome/JS/termfox/TermfoxCore.sys.mjs     pure helpers: key map, geometry, paint hook, file log
 tests/core.test.mjs                               node --test tests/*.test.mjs (pure helpers)
 tests/windows.test.mjs                            runs termfox.uc.mjs against a fake gBrowser + SessionStore
+tests/installer.test.mjs                          install/uninstall share one safety-helper block; elevated = Program Files only
+tests/installer-selftest.ps1                      Windows: no-admin loader write/rollback/uninstall on a fake per-user Firefox
 profile/chrome/CSS/termfox.uc.css                 pane geometry, focus frame, palette
 ```
 

@@ -3,11 +3,15 @@
   termfox day-1 spike installer (Windows, Firefox Release).
 
 .DESCRIPTION
-  1. Finds your Firefox Release install folder.
+  1. Finds your Firefox Release install folder: per-machine (Program Files), per-user
+     (%LOCALAPPDATA%\Mozilla Firefox), or wherever the registry (HKCU/HKLM) or PATH points. With
+     several, it uses -FirefoxDir, else the one on PATH, else your default browser, and says which.
   2. Downloads fx-autoconfig at a PINNED commit and checks the SHA-256 of every file.
-  3. Asks for admin (UAC) ONLY to write two files into the Firefox program folder:
+  3. Writes two files into the Firefox program folder:
        <Firefox>\config.js
        <Firefox>\defaults\pref\config-prefs.js
+     If you can write there (a per-user Firefox), directly, with no UAC prompt. Otherwise it asks
+     for admin (UAC) for exactly this step.
   4. Creates a NEW profile "termfox" (firefox.exe -CreateProfile) and puts the
      loader files + termfox scripts in that profile's chrome\ folder.
   5. Writes a manifest so uninstall.ps1 removes exactly what was added.
@@ -19,13 +23,14 @@
   chrome\utils\chrome.manifest (only the termfox profile, unless something else adds one), and that
   code has full browser privileges. If you want the loader confined, install a separate copy of
   Firefox under Program Files just for termfox and pass it with -FirefoxDir.
+  A per-user Firefox folder can be changed by any program running as you, like your profile.
   fx-autoconfig: https://github.com/MrOtherGuy/fx-autoconfig#install
 
-  Safety (security audit M4/L1, 2026-10-08): the admin step checks the Firefox folder itself (under
-  Program Files, firefox.exe, no junctions), reads each staged file into memory, checks its SHA-256
-  against the hash hard-coded here, and writes exactly those bytes to a NEW file (never replacing
-  one). The manifest is written as a journal BEFORE the admin step, and a half-done admin step
-  rolls back what it wrote.
+  Safety (security audit M4/L1, 2026-10-08): the program-folder step, direct or elevated, checks the
+  Firefox folder (firefox.exe, no junctions; the elevated one accepts Program Files only and finds it
+  itself), reads each staged file into memory, checks its SHA-256 against the hash hard-coded here,
+  and writes exactly those bytes to a NEW file at a fixed path (never replacing one). The manifest
+  is written as a journal BEFORE that step, and a half-done step rolls back what it wrote.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\install.ps1
@@ -80,13 +85,13 @@ function Assert-NoReparse([string]$root, [string]$path) {
         $p = Get-FullPath (Split-Path -Parent $p)
     }
 }
-# Admin-only folders a Firefox install may live in.
+# Admin-only folders a Firefox install may live in (the only ones the elevated step accepts).
 function Get-ProtectedRoots {
     $roots = @()
     foreach ($v in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) { if ($v) { $roots += (Get-FullPath $v) } }
     return @($roots | Select-Object -Unique)
 }
-# HKLM only: HKCU can be changed by any program running as you.
+# For the elevated step: HKLM only, because HKCU can be changed by any program running as you.
 function Get-RegisteredFirefoxDirs {
     $out = @()
     foreach ($root in @("HKLM:\SOFTWARE\Mozilla\Mozilla Firefox", "HKLM:\SOFTWARE\WOW6432Node\Mozilla\Mozilla Firefox")) {
@@ -150,6 +155,48 @@ function Assert-ResultFile([string]$path) {
     return $full
 }
 function New-ResultFilePath { return (Join-Path $env:TEMP ("termfox-result-" + [guid]::NewGuid().ToString("N") + ".json")) }
+# Per-user Firefox installs: the Firefox installer run without admin puts Firefox in
+# %LOCALAPPDATA%\Mozilla Firefox. Any program running as you can change these (like your profile).
+function Get-UserRoots {
+    if ($env:LOCALAPPDATA) { return @(Get-FullPath $env:LOCALAPPDATA) }
+    return @()
+}
+# Why termfox won't put the loader in $dir ($null = it may): it must be under Program Files or
+# %LOCALAPPDATA% (not the Store's WindowsApps), hold a real firefox.exe, no junction/symlink on the way.
+function Get-FirefoxDirProblem([string]$dir) {
+    if (-not $dir) { return "no folder given" }
+    try {
+        $full = Get-FullPath $dir
+        if ($full.StartsWith('\\')) { return "network path" }
+        if ($full -like "*\WindowsApps" -or $full -like "*\WindowsApps\*") { return "Microsoft Store (MSIX) Firefox: its program folder is read-only; install Firefox from mozilla.org" }
+        $exe = Join-Path $full "firefox.exe"
+        if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { return "no firefox.exe" }
+        $root = @(@(Get-ProtectedRoots) + @(Get-UserRoots)) | Where-Object { Test-Under $_ $full } | Select-Object -First 1
+        if (-not $root) { return "not under Program Files or %LOCALAPPDATA%" }
+        Assert-NoReparse $root $full
+        if (Test-ReparsePoint $exe) { return "firefox.exe is a link" }
+        return $null
+    } catch { return "$_" }
+}
+# Can this account create (and delete) a file in $dir? Tested with a real temp file, not by reading
+# ACLs: inherited ACEs, group membership and controlled-folder access make guessing unreliable.
+function Test-CanCreateFile([string]$dir) {
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return $false }
+    $probe = Join-Path $dir (".termfox-write-test-" + [guid]::NewGuid().ToString("N") + ".tmp")
+    try { Write-NewFile $probe ([byte[]]@()) } catch { return $false }
+    try { Remove-Item -LiteralPath $probe -Force; return $true }
+    catch { Write-Host "    could not delete write test file $probe (delete it by hand)" -ForegroundColor Yellow; return $false }
+}
+# True when both fixed destinations' folders are writable without admin, so no UAC prompt is needed.
+function Test-CanWriteProgramTargets([string]$ffDir) {
+    try {
+        foreach ($t in $ProgramTargets) {
+            if (-not (Test-CanCreateFile (Split-Path -Parent (Get-ProgramTargetPath $ffDir $t)))) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+# ---------------------------------------------------------------- end of shared safety helpers
 
 # ---------------------------------------------------------------- pinned loader
 $FxacCommit = "dfdab5684faffc112b76ccb1d8cab7f75da0102c"   # fx-autoconfig master, 2026-07-23, loader 0.10.16
@@ -187,16 +234,13 @@ function Read-VerifiedBytes([string]$path, [string]$sha) {
     return ,$bytes
 }
 
-# ================================================================ elevated child
-# Runs as admin. Writes ONLY the two fixed program files, from verified in-memory bytes, to new
-# files in a Firefox folder it checked itself. On a failure it removes what it wrote in this run.
-if ($ElevatedProgramCopy) {
-    try { $ResultFile = Assert-ResultFile $ResultFile } catch { Write-Host "ERROR: $_" -ForegroundColor Red; Start-Sleep -Seconds 5; exit 1 }
+# Writes ONLY the two fixed program files into $ff, from verified in-memory bytes, to new files.
+# On a failure it removes what it wrote in this call. Used by the elevated child and, when you can
+# write to the Firefox folder yourself, directly (no UAC). Returns the result record.
+function Install-ProgramTargets([string]$ff, [string]$stage) {
     $written = @()
     $rolledBack = @()
     try {
-        $ff = Resolve-TrustedFirefoxDir $FirefoxDir
-        $stage = Get-FullPath $StagingDir
         foreach ($t in $ProgramTargets) {
             $dst = Get-ProgramTargetPath $ff $t
             if (Test-Path -LiteralPath $dst) {
@@ -216,8 +260,7 @@ if ($ElevatedProgramCopy) {
             $written += @{ Path = $dst; Created = $true }
             Write-Wrote $dst
         }
-        Write-NewFile $ResultFile ([Text.Encoding]::UTF8.GetBytes((@{ ok = $true; files = $written; firefoxDir = $ff } | ConvertTo-Json -Depth 5)))
-        exit 0
+        return @{ ok = $true; files = $written; firefoxDir = $ff }
     } catch {
         $err = "$_"
         # Roll back: remove files this run created, if they still hold exactly what was written.
@@ -229,11 +272,22 @@ if ($ElevatedProgramCopy) {
             } catch { }
         }
         $left = @($written | Where-Object { $_.Created -and $rolledBack -notcontains $_.Path })
-        Write-NewFile $ResultFile ([Text.Encoding]::UTF8.GetBytes((@{ ok = $false; error = $err; files = $left; rolledBack = $rolledBack } | ConvertTo-Json -Depth 5)))
-        Write-Host "ERROR: $err" -ForegroundColor Red
-        Start-Sleep -Seconds 5
-        exit 1
+        return @{ ok = $false; error = $err; files = $left; rolledBack = $rolledBack }
     }
+}
+
+# ================================================================ elevated child
+# Runs as admin. Checks the Firefox folder itself (Program Files only, HKLM only), then writes the
+# two fixed files as above.
+if ($ElevatedProgramCopy) {
+    try { $ResultFile = Assert-ResultFile $ResultFile } catch { Write-Host "ERROR: $_" -ForegroundColor Red; Start-Sleep -Seconds 5; exit 1 }
+    try { $res = Install-ProgramTargets (Resolve-TrustedFirefoxDir $FirefoxDir) (Get-FullPath $StagingDir) }
+    catch { $res = @{ ok = $false; error = "$_"; files = @(); rolledBack = @() } }
+    Write-NewFile $ResultFile ([Text.Encoding]::UTF8.GetBytes(($res | ConvertTo-Json -Depth 5)))
+    if ($res.ok) { exit 0 }
+    Write-Host "ERROR: $($res.error)" -ForegroundColor Red
+    Start-Sleep -Seconds 5
+    exit 1
 }
 
 # ================================================================ main (runs as you)
@@ -264,23 +318,84 @@ if (Get-Process -Name firefox -ErrorAction SilentlyContinue) {
 
 # ---------------------------------------------------------------- find Firefox Release
 Write-Step "Finding Firefox Release"
-function Find-FirefoxDir {
-    foreach ($c in Get-RegisteredFirefoxDirs) {
-        if ($c -and (Test-Path -LiteralPath (Join-Path $c "firefox.exe"))) { return (Resolve-Path -LiteralPath $c).Path }
+# Every install we can see: per-machine (Program Files), per-user (%LOCALAPPDATA%), and whatever the
+# registry (HKCU and HKLM) or PATH points to. Keyed by folder; each remembers where it was seen.
+$Candidates = [ordered]@{}
+function Add-FirefoxCandidate([string]$dir, [string]$source) {
+    if (-not $dir) { return }
+    try { $full = Get-FullPath ([Environment]::ExpandEnvironmentVariables($dir.Trim().Trim('"'))) } catch { return }
+    if (-not (Test-Path -LiteralPath (Join-Path $full "firefox.exe") -PathType Leaf)) { return }
+    $k = $full.ToLowerInvariant()
+    if (-not $Candidates.Contains($k)) {
+        $Candidates[$k] = [pscustomobject]@{ Dir = $full; Sources = (New-Object System.Collections.ArrayList); Problem = (Get-FirefoxDirProblem $full) }
     }
-    return $null
+    if ($Candidates[$k].Sources -notcontains $source) { [void]$Candidates[$k].Sources.Add($source) }
 }
-if (-not $FirefoxDir) { $FirefoxDir = Find-FirefoxDir }
-if (-not $FirefoxDir -or -not (Test-Path -LiteralPath (Join-Path $FirefoxDir "firefox.exe"))) {
-    Fail "Could not find firefox.exe. Pass it explicitly: -FirefoxDir 'C:\Program Files\Mozilla Firefox'"
+# Folder of firefox.exe in a command line such as "C:\...\firefox.exe" -osint -url "%1".
+function Get-FirefoxDirFromCommand([string]$cmd) {
+    if (-not $cmd) { return $null }
+    $c = [Environment]::ExpandEnvironmentVariables($cmd.Trim())
+    if ($c.StartsWith('"')) { $end = $c.IndexOf('"', 1); if ($end -lt 2) { return $null }; $exe = $c.Substring(1, $end - 1) }
+    else { $i = $c.ToLowerInvariant().IndexOf(".exe"); if ($i -lt 0) { return $null }; $exe = $c.Substring(0, $i + 4) }
+    if ((Split-Path -Leaf $exe) -ine "firefox.exe") { return $null }
+    return (Split-Path -Parent $exe)
 }
-if ($FirefoxDir -like "*\WindowsApps\*") {
-    Fail "This is the Microsoft Store (MSIX) Firefox; its program folder is read-only. Install Firefox from mozilla.org."
+function Find-FirefoxCandidates {
+    $onPath = Get-Command firefox.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($onPath) { Add-FirefoxCandidate (Split-Path -Parent $onPath.Path) "on PATH" }
+    try {
+        $progId = (Get-ItemProperty -LiteralPath "HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice" -ErrorAction Stop).ProgId
+        if ($progId -like "FirefoxURL*") {
+            $cmd = (Get-ItemProperty -LiteralPath "Registry::HKEY_CLASSES_ROOT\$progId\shell\open\command" -ErrorAction Stop).'(default)'
+            Add-FirefoxCandidate (Get-FirefoxDirFromCommand $cmd) "default browser"
+        }
+    } catch { }
+    foreach ($hive in @("HKCU", "HKLM")) {
+        try {
+            $ap = (Get-ItemProperty -LiteralPath "${hive}:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\firefox.exe" -ErrorAction Stop).'(default)'
+            if ($ap) { Add-FirefoxCandidate (Split-Path -Parent $ap.Trim('"')) "App Paths ($hive)" }
+        } catch { }
+    }
+    foreach ($key in @("HKCU:\SOFTWARE\Mozilla\Mozilla Firefox", "HKLM:\SOFTWARE\Mozilla\Mozilla Firefox", "HKLM:\SOFTWARE\WOW6432Node\Mozilla\Mozilla Firefox")) {
+        try {
+            $cur = (Get-ItemProperty -LiteralPath $key -ErrorAction Stop).CurrentVersion
+            if ($cur) { Add-FirefoxCandidate (Get-ItemProperty -LiteralPath "$key\$cur\Main" -ErrorAction Stop).'Install Directory' "registry $($key.Substring(0, 4))" }
+        } catch { }
+    }
+    foreach ($v in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) { if ($v) { Add-FirefoxCandidate (Join-Path $v "Mozilla Firefox") "per-machine default folder" } }
+    if ($env:LOCALAPPDATA) { Add-FirefoxCandidate (Join-Path $env:LOCALAPPDATA "Mozilla Firefox") "per-user default folder" }
 }
-if (-not (Test-TrustedFirefoxDir $FirefoxDir)) {
-    Fail "$FirefoxDir must be under Program Files (admin-only) with no junctions; termfox won't install a loader elsewhere."
+Find-FirefoxCandidates
+$all = @($Candidates.Values)
+foreach ($c in $all) {
+    $note = if ($c.Problem) { "  -- can't use: $($c.Problem)" } else { "" }
+    Write-Host "    found  $($c.Dir)  [$($c.Sources -join ', ')]$note"
 }
-$FirefoxDir = Get-FullPath $FirefoxDir
+$usable = @($all | Where-Object { -not $_.Problem })
+if ($FirefoxDir) {
+    $problem = Get-FirefoxDirProblem $FirefoxDir
+    if ($problem) { Fail "-FirefoxDir $FirefoxDir can't be used: $problem." }
+    $FirefoxDir = Get-FullPath $FirefoxDir
+    $why = "you passed -FirefoxDir"
+} else {
+    $pick = $null; $why = ""
+    foreach ($rule in @(@("on PATH", "it is the firefox.exe on PATH"), @("default browser", "it is your default browser"))) {
+        if (-not $pick) {
+            $pick = $usable | Where-Object { $_.Sources -contains $rule[0] } | Select-Object -First 1
+            if ($pick) { $why = $rule[1] }
+        }
+    }
+    if (-not $pick -and $usable.Count -gt 0) { $pick = $usable[0]; $why = "first one found (none is on PATH or your default browser)" }
+    if (-not $pick) {
+        if ($all.Count -eq 0) { Fail "Could not find firefox.exe. Install Firefox from mozilla.org (see INSTALL.md), or pass -FirefoxDir." }
+        Fail "No usable Firefox Release found (see above). Install Firefox from mozilla.org, or pass -FirefoxDir."
+    }
+    $FirefoxDir = $pick.Dir
+}
+Write-Host "    using  $FirefoxDir  (because $why)" -ForegroundColor White
+if (-not $PSBoundParameters.ContainsKey("FirefoxDir") -and $usable.Count -gt 1) {
+    Write-Host "    Several Firefox installs found. To use another one, re-run with -FirefoxDir `"<folder>`"." -ForegroundColor Yellow
+}
 $FirefoxExe = Join-Path $FirefoxDir "firefox.exe"
 $channel = "unknown"
 $channelFile = Join-Path $FirefoxDir "defaults\pref\channel-prefs.js"
@@ -289,10 +404,19 @@ if (Test-Path -LiteralPath $channelFile) {
     if ($m) { $channel = $m.Matches[0].Groups[1].Value }
 }
 $version = (Get-Item -LiteralPath $FirefoxExe).VersionInfo.ProductVersion
-Write-Host "    Firefox: $FirefoxDir"
 Write-Host "    version: $version   channel: $channel"
 if ($channel -ne "release" -and -not $Force) {
     Fail "Expected the 'release' channel, found '$channel'. Re-run with -Force if this is intended."
+}
+# Admin only when needed: if you can create files in both destination folders (a per-user install
+# in %LOCALAPPDATA%, or an already elevated window), write them directly with no UAC prompt.
+$DirectWrite = Test-CanWriteProgramTargets $FirefoxDir
+if ($DirectWrite) {
+    Write-Host "    you can write to this Firefox folder: no admin prompt needed"
+} elseif (Test-TrustedFirefoxDir $FirefoxDir) {
+    Write-Host "    this Firefox folder needs admin to change: one UAC prompt later"
+} else {
+    Fail "You can't write to $FirefoxDir, and it is not under Program Files, so the admin step won't touch it either."
 }
 
 # Refuse to clobber an existing autoconfig (e.g. an enterprise or other mod setup).
@@ -341,8 +465,8 @@ if ((Test-Path -LiteralPath $ProfilesIni) -and (Select-String -LiteralPath $Prof
     Fail "A profile named '$ProfileName' already exists in $ProfilesIni. Not touching it."
 }
 
-# ---------------------------------------------------------------- journal, then the elevated step
-# The manifest is written BEFORE the admin step and lists both program files it may create
+# ---------------------------------------------------------------- journal, then the program-folder step
+# The manifest is written BEFORE the program-folder step (direct or admin) and lists both program files it may create
 # ("Created": true unless already there, identical). uninstall.ps1 deletes a listed file only if it
 # holds exactly the fx-autoconfig bytes, so a journal entry for a file never written is harmless.
 New-Item -ItemType Directory -Path $ManifestDir -Force | Out-Null
@@ -353,41 +477,53 @@ $manifest = [ordered]@{
     profileName = $ProfileName; profileDir = $ProfileDir
     profileLocalDir = (Join-Path $env:LOCALAPPDATA "Mozilla\Firefox\Profiles\$ProfileName")
     profileCreated = $false
+    programWriteMode = $(if ($DirectWrite) { "direct" } else { "elevated" })
 }
 function Save-Manifest { $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8 }
 Save-Manifest
 Write-Wrote "$ManifestPath  (journal)"
 
-Write-Step "Admin step: write 2 files into the Firefox program folder"
-Write-Host "    These files will be written (UAC prompt next):"
-foreach ($f in $ProgramFiles) { Write-Host "      $(Join-Path $FirefoxDir $f.Dst)" }
-$resultFile = New-ResultFilePath
-$argList = @(
-    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$($MyInvocation.MyCommand.Path)`"",
-    "-ElevatedProgramCopy", "-FirefoxDir", "`"$FirefoxDir`"", "-StagingDir", "`"$Staging`"", "-ResultFile", "`"$resultFile`""
-)
-try {
-    $proc = Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argList -Wait -PassThru
-} catch {
-    Remove-Item -LiteralPath $ManifestDir -Recurse -Force
-    Fail "Admin prompt was cancelled. Nothing was installed."
+if ($DirectWrite) {
+    $StepName = "Loader step"
+    Write-Step "Loader step: write 2 files into the Firefox program folder (no admin needed)"
+    # Same checks the elevated child makes, re-made right before writing (folder may have changed).
+    $problem = Get-FirefoxDirProblem $FirefoxDir
+    if ($problem) { $elev = @{ ok = $false; error = $problem; files = @() } }
+    else { $elev = Install-ProgramTargets $FirefoxDir $Staging }
+} else {
+    $StepName = "Admin step"
+    Write-Step "Admin step: write 2 files into the Firefox program folder"
+    Write-Host "    These files will be written (UAC prompt next):"
+    foreach ($f in $ProgramFiles) { Write-Host "      $(Join-Path $FirefoxDir $f.Dst)" }
+    $resultFile = New-ResultFilePath
+    $argList = @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$($MyInvocation.MyCommand.Path)`"",
+        "-ElevatedProgramCopy", "-FirefoxDir", "`"$FirefoxDir`"", "-StagingDir", "`"$Staging`"", "-ResultFile", "`"$resultFile`""
+    )
+    try {
+        $proc = Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argList -Wait -PassThru
+    } catch {
+        Remove-Item -LiteralPath $ManifestDir -Recurse -Force
+        Fail "Admin prompt was cancelled. Nothing was installed."
+    }
+    if (-not (Test-Path -LiteralPath $resultFile)) {
+        Fail "Admin step produced no result (exit $($proc.ExitCode)). The journal at $ManifestPath is kept; run uninstall.ps1 to clean up."
+    }
+    $elev = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
+    Remove-Item -LiteralPath $resultFile -Force
 }
-if (-not (Test-Path -LiteralPath $resultFile)) {
-    Fail "Admin step produced no result (exit $($proc.ExitCode)). The journal at $ManifestPath is kept; run uninstall.ps1 to clean up."
-}
-$elev = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
-Remove-Item -LiteralPath $resultFile -Force
 if (-not $elev.ok) {
     $left = @($elev.files | Where-Object { $_ })
     if ($left.Count -eq 0) {
         Remove-Item -LiteralPath $ManifestDir -Recurse -Force
-        Fail "Admin step failed: $($elev.error). It rolled back what it wrote; nothing was installed."
+        Fail "$StepName failed: $($elev.error). It rolled back what it wrote; nothing was installed."
     }
     $manifest.programFiles = @($left | ForEach-Object { [ordered]@{ Path = $_.Path; Created = $true; State = "written" } })
     Save-Manifest
-    Fail "Admin step failed: $($elev.error). Could not roll back: $(($left | ForEach-Object { $_.Path }) -join ', '). Run uninstall.ps1."
+    Fail "$StepName failed: $($elev.error). Could not roll back: $(($left | ForEach-Object { $_.Path }) -join ', '). Run uninstall.ps1."
 }
-foreach ($w in $elev.files) { if ($w.Created) { Write-Wrote $w.Path } else { Write-Host "    exists (identical)  $($w.Path)" } }
+# (the direct write already printed each file; the elevated child printed in its own window)
+if (-not $DirectWrite) { foreach ($w in $elev.files) { if ($w.Created) { Write-Wrote $w.Path } else { Write-Host "    exists (identical)  $($w.Path)" } } }
 $manifest.firefoxDir = $elev.firefoxDir
 $manifest.programFiles = @($elev.files | ForEach-Object { [ordered]@{ Path = $_.Path; Created = [bool]$_.Created; State = "written" } })
 Save-Manifest

@@ -3,8 +3,9 @@
   Removes what termfox install.ps1 added, using its manifest
   (%LOCALAPPDATA%\termfox\install-manifest.json, or %LOCALAPPDATA%\tilefox\install-manifest.json for an
   install made before the rename to termfox, whose profile is "tilefox-spike"):
-    - <Firefox>\config.js and <Firefox>\defaults\pref\config-prefs.js (admin; only files the
-      installer created, and only if they are byte-identical to the fx-autoconfig files termfox installs)
+    - <Firefox>\config.js and <Firefox>\defaults\pref\config-prefs.js (only files the installer
+      created, and only if they are byte-identical to the fx-autoconfig files termfox installs). Directly,
+      with no UAC prompt, if you can write to that Firefox folder (a per-user Firefox); else as admin.
     - the "termfox" (or old "tilefox-spike") profile: its [ProfileN] entry in profiles.ini and its folders
     - the manifest folder (kept, listing what is left, if anything could not be removed)
   Other profiles are never touched. Close ALL Firefox windows first.
@@ -15,7 +16,10 @@
   can edit, so it is treated as untrusted. Its schema is checked; the profile folders must be exactly
   <AppData>\Mozilla\Firefox\Profiles\<name> (and the Local twin) with no junctions; the elevated step
   reads no manifest at all: it finds the Firefox folder itself and only ever deletes the two fixed
-  files above, only when their SHA-256 matches the hashes hard-coded in this script.
+  files above, only when their SHA-256 matches the hashes hard-coded in this script. The direct
+  (no-admin) step uses the manifest's Firefox folder only after the same folder checks as install
+  (Program Files or %LOCALAPPDATA%, firefox.exe, no junctions) and deletes under the same rules; it
+  runs as you, so it can do nothing a program running as you couldn't already.
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\uninstall.ps1
@@ -72,13 +76,13 @@ function Assert-NoReparse([string]$root, [string]$path) {
         $p = Get-FullPath (Split-Path -Parent $p)
     }
 }
-# Admin-only folders a Firefox install may live in.
+# Admin-only folders a Firefox install may live in (the only ones the elevated step accepts).
 function Get-ProtectedRoots {
     $roots = @()
     foreach ($v in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramW6432)) { if ($v) { $roots += (Get-FullPath $v) } }
     return @($roots | Select-Object -Unique)
 }
-# HKLM only: HKCU can be changed by any program running as you.
+# For the elevated step: HKLM only, because HKCU can be changed by any program running as you.
 function Get-RegisteredFirefoxDirs {
     $out = @()
     foreach ($root in @("HKLM:\SOFTWARE\Mozilla\Mozilla Firefox", "HKLM:\SOFTWARE\WOW6432Node\Mozilla\Mozilla Firefox")) {
@@ -142,6 +146,48 @@ function Assert-ResultFile([string]$path) {
     return $full
 }
 function New-ResultFilePath { return (Join-Path $env:TEMP ("termfox-result-" + [guid]::NewGuid().ToString("N") + ".json")) }
+# Per-user Firefox installs: the Firefox installer run without admin puts Firefox in
+# %LOCALAPPDATA%\Mozilla Firefox. Any program running as you can change these (like your profile).
+function Get-UserRoots {
+    if ($env:LOCALAPPDATA) { return @(Get-FullPath $env:LOCALAPPDATA) }
+    return @()
+}
+# Why termfox won't put the loader in $dir ($null = it may): it must be under Program Files or
+# %LOCALAPPDATA% (not the Store's WindowsApps), hold a real firefox.exe, no junction/symlink on the way.
+function Get-FirefoxDirProblem([string]$dir) {
+    if (-not $dir) { return "no folder given" }
+    try {
+        $full = Get-FullPath $dir
+        if ($full.StartsWith('\\')) { return "network path" }
+        if ($full -like "*\WindowsApps" -or $full -like "*\WindowsApps\*") { return "Microsoft Store (MSIX) Firefox: its program folder is read-only; install Firefox from mozilla.org" }
+        $exe = Join-Path $full "firefox.exe"
+        if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { return "no firefox.exe" }
+        $root = @(@(Get-ProtectedRoots) + @(Get-UserRoots)) | Where-Object { Test-Under $_ $full } | Select-Object -First 1
+        if (-not $root) { return "not under Program Files or %LOCALAPPDATA%" }
+        Assert-NoReparse $root $full
+        if (Test-ReparsePoint $exe) { return "firefox.exe is a link" }
+        return $null
+    } catch { return "$_" }
+}
+# Can this account create (and delete) a file in $dir? Tested with a real temp file, not by reading
+# ACLs: inherited ACEs, group membership and controlled-folder access make guessing unreliable.
+function Test-CanCreateFile([string]$dir) {
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return $false }
+    $probe = Join-Path $dir (".termfox-write-test-" + [guid]::NewGuid().ToString("N") + ".tmp")
+    try { Write-NewFile $probe ([byte[]]@()) } catch { return $false }
+    try { Remove-Item -LiteralPath $probe -Force; return $true }
+    catch { Write-Host "    could not delete write test file $probe (delete it by hand)" -ForegroundColor Yellow; return $false }
+}
+# True when both fixed destinations' folders are writable without admin, so no UAC prompt is needed.
+function Test-CanWriteProgramTargets([string]$ffDir) {
+    try {
+        foreach ($t in $ProgramTargets) {
+            if (-not (Test-CanCreateFile (Split-Path -Parent (Get-ProgramTargetPath $ffDir $t)))) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+# ---------------------------------------------------------------- end of shared safety helpers
 
 $ManifestDir  = Join-Path $env:LOCALAPPDATA "termfox"
 $ManifestPath = Join-Path $ManifestDir "install-manifest.json"
@@ -175,16 +221,14 @@ function Write-Step([string]$msg) { Write-Host "==> $msg" -ForegroundColor Cyan 
 function Write-Removed([string]$path) { Write-Host "    removed  $path" -ForegroundColor Green }
 function Fail([string]$msg) { Write-Host "ERROR: $msg" -ForegroundColor Red; exit 1 }
 
-# ================================================================ elevated child
-# Runs as admin. Reads no manifest. Deletes at most the two fixed program files, and only when
-# their bytes are the fx-autoconfig files termfox installs (hard-coded hashes).
-if ($ElevatedProgramRemove) {
-    try { $ResultFile = Assert-ResultFile $ResultFile } catch { Write-Host "ERROR: $_" -ForegroundColor Red; Start-Sleep -Seconds 5; exit 1 }
+# Deletes at most the two fixed program files in $ff, and only when their bytes are the fx-autoconfig
+# files termfox installs (hard-coded hashes). Used by the elevated child and, when you can write to
+# the Firefox folder yourself, directly (no UAC). Returns the result record.
+function Remove-ProgramTargets([string]$ff, [bool]$removeJs, [bool]$removePrefs) {
     $log = @(); $kept = @(); $removed = @()
     try {
-        $ff = Resolve-TrustedFirefoxDir $FirefoxDirHint
         foreach ($t in $ProgramTargets) {
-            $want = if ($t.Key -eq "configJs") { $RemoveConfigJs } else { $RemoveConfigPrefs }
+            $want = if ($t.Key -eq "configJs") { $removeJs } else { $removePrefs }
             if (-not $want) { continue }
             $dst = Get-ProgramTargetPath $ff $t
             if (-not (Test-Path -LiteralPath $dst)) { $log += "already gone: $dst"; $removed += $t.Key; continue }
@@ -194,14 +238,23 @@ if ($ElevatedProgramRemove) {
             Remove-Item -LiteralPath $dst -Force
             $log += "removed: $dst"; $removed += $t.Key
         }
-        Write-NewFile $ResultFile ([Text.Encoding]::UTF8.GetBytes((@{ ok = $true; log = $log; kept = $kept; removed = $removed; firefoxDir = $ff } | ConvertTo-Json -Depth 4)))
-        exit 0
+        return @{ ok = $true; log = $log; kept = $kept; removed = $removed; firefoxDir = $ff }
     } catch {
-        Write-NewFile $ResultFile ([Text.Encoding]::UTF8.GetBytes((@{ ok = $false; error = "$_"; log = $log; kept = $kept; removed = $removed } | ConvertTo-Json -Depth 4)))
-        Write-Host "ERROR: $_" -ForegroundColor Red
-        Start-Sleep -Seconds 5
-        exit 1
+        return @{ ok = $false; error = "$_"; log = $log; kept = $kept; removed = $removed }
     }
+}
+
+# ================================================================ elevated child
+# Runs as admin. Reads no manifest: finds the Firefox folder itself (Program Files only, HKLM only).
+if ($ElevatedProgramRemove) {
+    try { $ResultFile = Assert-ResultFile $ResultFile } catch { Write-Host "ERROR: $_" -ForegroundColor Red; Start-Sleep -Seconds 5; exit 1 }
+    try { $res = Remove-ProgramTargets (Resolve-TrustedFirefoxDir $FirefoxDirHint) $RemoveConfigJs.IsPresent $RemoveConfigPrefs.IsPresent }
+    catch { $res = @{ ok = $false; error = "$_"; log = @(); kept = @(); removed = @() } }
+    Write-NewFile $ResultFile ([Text.Encoding]::UTF8.GetBytes(($res | ConvertTo-Json -Depth 4)))
+    if ($res.ok) { exit 0 }
+    Write-Host "ERROR: $($res.error)" -ForegroundColor Red
+    Start-Sleep -Seconds 5
+    exit 1
 }
 
 # ================================================================ manifest (untrusted input)
@@ -357,9 +410,9 @@ if ($KeepProfile -and $m.profileCreated) {
     Write-Host "    devtools.chrome.enabled setting in prefs.js, and termfox window names in its session." -ForegroundColor Yellow
 }
 
-# ---------------------------------------------------------------- program folder (admin)
-# The manifest only says WHICH of the two fixed files the installer created; the elevated step
-# decides everything else for itself.
+# ---------------------------------------------------------------- program folder (direct or admin)
+# The manifest only says WHICH of the two fixed files the installer created (and, for the direct
+# path, the folder); the elevated step decides everything else for itself.
 $want = @{}
 foreach ($f in @($m.programFiles)) {
     if ($null -eq $f -or -not $f.Created) { continue }
@@ -367,20 +420,31 @@ foreach ($f in @($m.programFiles)) {
 }
 $retained = @()
 if ($want.Count -gt 0) {
-    Write-Step "Admin step: remove termfox's files from the Firefox program folder"
-    $resultFile = New-ResultFilePath
-    $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$($MyInvocation.MyCommand.Path)`"",
-                 "-ElevatedProgramRemove", "-ResultFile", "`"$resultFile`"")
-    if ((& $hasProp $m "firefoxDir") -and $m.firefoxDir) { $argList += @("-FirefoxDirHint", "`"$($m.firefoxDir)`"") }
-    if ($want.configJs) { $argList += "-RemoveConfigJs" }
-    if ($want.configPrefs) { $argList += "-RemoveConfigPrefs" }
-    try { Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argList -Wait | Out-Null }
-    catch { Fail "Admin prompt cancelled. Program files left in place; the manifest is kept so you can re-run." }
-    if (-not (Test-Path -LiteralPath $resultFile)) { Fail "Admin step produced no result. Manifest kept; re-run uninstall.ps1." }
-    $r = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
-    Remove-Item -LiteralPath $resultFile -Force
+    # Admin only when needed: the folder from the manifest is used directly only if it passes the same
+    # checks as at install AND you can really create files there (a per-user Firefox). Else UAC.
+    $hint = if ((& $hasProp $m "firefoxDir") -and $m.firefoxDir) { $m.firefoxDir } else { "" }
+    $direct = [bool]($hint -and -not (Get-FirefoxDirProblem $hint) -and (Test-CanWriteProgramTargets $hint))
+    if ($direct) {
+        $StepName = "Loader step"
+        Write-Step "Loader step: remove termfox's files from the Firefox program folder (no admin needed)"
+        $r = Remove-ProgramTargets (Get-FullPath $hint) ([bool]$want.configJs) ([bool]$want.configPrefs)
+    } else {
+        $StepName = "Admin step"
+        Write-Step "Admin step: remove termfox's files from the Firefox program folder"
+        $resultFile = New-ResultFilePath
+        $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$($MyInvocation.MyCommand.Path)`"",
+                     "-ElevatedProgramRemove", "-ResultFile", "`"$resultFile`"")
+        if ((& $hasProp $m "firefoxDir") -and $m.firefoxDir) { $argList += @("-FirefoxDirHint", "`"$($m.firefoxDir)`"") }
+        if ($want.configJs) { $argList += "-RemoveConfigJs" }
+        if ($want.configPrefs) { $argList += "-RemoveConfigPrefs" }
+        try { Start-Process -FilePath "powershell.exe" -Verb RunAs -ArgumentList $argList -Wait | Out-Null }
+        catch { Fail "Admin prompt cancelled. Program files left in place; the manifest is kept so you can re-run." }
+        if (-not (Test-Path -LiteralPath $resultFile)) { Fail "Admin step produced no result. Manifest kept; re-run uninstall.ps1." }
+        $r = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
+        Remove-Item -LiteralPath $resultFile -Force
+    }
     foreach ($l in @($r.log)) { if ($l) { Write-Host "    $l" } }
-    if (-not $r.ok) { Fail "Admin step failed: $($r.error). Manifest kept; re-run uninstall.ps1." }
+    if (-not $r.ok) { Fail "$StepName failed: $($r.error). Manifest kept; re-run uninstall.ps1." }
     $retained = @($m.programFiles | Where-Object { $_ -and $_.Created -and (
         ($_.Path -like "*\defaults\pref\config-prefs.js" -and @($r.kept) -contains "configPrefs") -or
         ($_.Path -like "*\config.js" -and -not ($_.Path -like "*\defaults\pref\config-prefs.js") -and @($r.kept) -contains "configJs")) })

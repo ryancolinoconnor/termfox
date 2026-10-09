@@ -26,7 +26,10 @@ If this section fails, stop: it is a Firefox/Windows problem, not termfox. After
 
 ## 1. Install, ~10 min
 
-- [ ] `install.ps1` ran without errors, and the UAC prompt listed exactly `config.js` and `defaults\pref\config-prefs.js`
+- [ ] `install.ps1` ran without errors, printed every Firefox it found and the one it chose (and why), and the UAC prompt listed exactly `config.js` and `defaults\pref\config-prefs.js`
+- [ ] (no-admin path, ideally on a standard Windows account) Firefox installed per-user (installer's admin prompt closed → `%LOCALAPPDATA%\Mozilla Firefox`): `install.ps1` says "no admin prompt needed", shows **no** UAC prompt, and both files appear in that folder; `launch-termfox.cmd` starts that Firefox and the `[termfox]` lines show; `uninstall.ps1` removes them, again with no UAC prompt
+- [ ] (both installed) with a Program Files and a per-user Firefox, the installer picks the one on PATH / your default browser and says so; `-FirefoxDir` overrides it
+- [ ] `powershell -ExecutionPolicy Bypass -File .\tests\installer-selftest.ps1` ends with `failures: 0` (fake Firefox only, no admin)
 - [ ] Launch with `launch-termfox.cmd`. The window opens on the **termfox** profile (`about:profiles` shows it as "This is the profile in use")
 - [ ] Browser Console (Ctrl+Shift+J) shows `[termfox] JSWindowActor registered` and `[termfox] ready in window; paused = false`
 - [ ] Your normal Firefox profile still opens as before (`firefox.exe` without `-P`) and does not show the `[termfox]` lines
@@ -158,7 +161,7 @@ In each pane (click it first):
 ## 10. Uninstall, ~5 min
 
 - [ ] Close Firefox, run `uninstall.ps1`, and type YES to delete the spike profile
-- [ ] `C:\Program Files\Mozilla Firefox\config.js` is gone, and `defaults\pref\config-prefs.js` is gone
+- [ ] `<Firefox>\config.js` is gone, and `defaults\pref\config-prefs.js` is gone (the Program Files or the per-user folder)
 - [ ] Your normal profile opens fine and `about:profiles` no longer lists termfox
 
 ## How to collect logs
